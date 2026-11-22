@@ -13,7 +13,12 @@ sys.path.insert(0, HERE)
 try:
     import requests  # noqa: F401
 except ImportError:  # keep the test runnable without installing anything
-    sys.modules["requests"] = types.ModuleType("requests")
+    _stub = types.ModuleType("requests")
+    _stub.ConnectionError = type("ConnectionError", (Exception,), {})
+    _stub.Timeout = type("Timeout", (Exception,), {})
+    _stub.Session = type("Session", (), {"__init__": lambda self: setattr(self, "headers", {}) or None})
+    _stub.Session.headers = type("H", (dict,), {})()
+    sys.modules["requests"] = _stub
 
 import translate_worker as tw  # noqa: E402
 
@@ -53,7 +58,7 @@ class EmptyEngine(KeepEngine):
 
 def fresh(engine_cls=KeepEngine):
     for k in ("chars", "model_s", "load_s", "kept", "split", "num_retry", "fmt_dropped",
-              "script_retry", "len_reject", "natural_ok", "protected_retry", "glossary_miss"):
+              "script_retry", "len_reject", "inline_ok", "protected_retry", "glossary_miss"):
         tw.STATS[k] = type(tw.STATS[k])()
     eng = engine_cls()
     return tw.Translator(eng, 16), eng
@@ -309,7 +314,7 @@ class ScriptEngine(tw.Engine):
 
 def with_engine(eng):
     for k in ("chars", "model_s", "load_s", "kept", "split", "num_retry", "fmt_dropped",
-              "script_retry", "len_reject", "natural_ok", "protected_retry", "glossary_miss"):
+              "script_retry", "len_reject", "inline_ok", "protected_retry", "glossary_miss"):
         tw.STATS[k] = type(tw.STATS[k])()
     return tw.Translator(eng, 16)
 
@@ -404,36 +409,41 @@ class NatEngine(tw.Engine):
 
     def translate(self, texts, src, tgt):
         self.calls.append(list(texts))
+        if callable(self.answers):
+            return [self.answers(t) for t in texts]
         return [self.answers.get(t, "؟؟") for t in texts]
 
 
 tw.load_glossary(os.path.join(HERE, "glossary.json"))
+S1 = "Rent 450 دينار كويتي per month."  # what attempt 1 sends for "Rent 450 KWD per month."
+P1 = "Rent 450 QXAXQ per month."        # what the protected method sends
 
-# ---- 25. natural first: accepted without placeholders
-tr = with_engine(NatEngine({"Rent 450 KWD per month.": "الإيجار 450 دينار كويتي شهريا.",
+# ---- 25. attempt 1: glossary written inline in the target language, no placeholders
+tr = with_engine(NatEngine({S1: "الإيجار 450 دينار كويتي شهريا.",
                             "Open 9 am to 5 pm.": "مفتوح من 9 صباحاً إلى 5 مساءً.",
-                            "Wedding hall in Sharq.": "قاعة زفاف في الشرق."}))
+                            "Wedding hall in شرق.": "قاعة زفاف في شرق."}))
 assert tr.field("Rent 450 KWD per month.", "en", "ar") == "الإيجار 450 دينار كويتي شهريا."
 assert tr.field("Open 9 am to 5 pm.", "en", "ar") == "مفتوح من 9 صباحاً إلى 5 مساءً."
-assert tr.field("Wedding hall in Sharq.", "en", "ar") == "قاعة زفاف في الشرق."
-assert tw.STATS["natural_ok"] == 3 and tw.STATS["protected_retry"] == 0, tw.STATS
-assert all("QX" not in t for c in tr.engine.calls for t in c) and tr.engine.calls[0] == ["Rent 450 KWD per month."]
-print("ok 25 natural first accepted")
+assert tr.field("Wedding hall in Sharq.", "en", "ar") == "قاعة زفاف في شرق."
+assert tw.STATS["inline_ok"] == 3 and tw.STATS["protected_retry"] == 0, tw.STATS
+assert all("QX" not in t for c in tr.engine.calls for t in c) and tr.engine.calls[0] == [S1]
+tr = with_engine(NatEngine({"Family shop in السالمية.": "متجر عائلي في السالمية.", "شقة في Salmiya": "Apartment in Salmiya"}))
+assert tr.field("Family shop in Salmiya.", "en", "ar") == "متجر عائلي في السالمية."
+assert tr.field("شقة في السالمية", "ar", "en") == "Apartment in Salmiya" and tw.STATS["inline_ok"] == 2
+tr = with_engine(NatEngine({}))
+assert tr.field("Salmiya", "en", "ar") == "السالمية" and not tr.engine.calls  # only a glossary term: no call
+print("ok 25 inline glossary")
 
 # ---- 26. glossary form missing -> redone with the protected method
-tr = with_engine(NatEngine({"Rent 450 KWD per month.": "الإيجار 450 دولار شهريا.",
-                            "Rent 450 QXAXQ per month.": "الإيجار 450 QXAXQ شهريا."}))
+tr = with_engine(NatEngine({S1: "الإيجار 450 دولار شهريا.", P1: "الإيجار 450 QXAXQ شهريا."}))
 assert tr.field("Rent 450 KWD per month.", "en", "ar") == "الإيجار 450 دينار كويتي شهريا."
-assert tw.STATS["natural_ok"] == 0 and tw.STATS["protected_retry"] == 1, tw.STATS
-tr = with_engine(NatEngine({"Wedding hall in Sharq.": "قاعة زفاف في الشمال.",
+assert tw.STATS["inline_ok"] == 0 and tw.STATS["protected_retry"] == 1, tw.STATS
+tr = with_engine(NatEngine({"Wedding hall in شرق.": "قاعة زفاف في الشمال.",
                             "Wedding hall in QXAXQ.": "قاعة زفاف في QXAXQ."}))
 assert tr.field("Wedding hall in Sharq.", "en", "ar") == "قاعة زفاف في شرق."
-tr = with_engine(NatEngine({"شقة في السالمية": "Apartment in Salmia",
-                            "شقة في QXAXQ": "Apartment in QXAXQ"}))
-assert tr.field("شقة في السالمية", "ar", "en") == "Apartment in Salmiya"  # prefix word kept as its own word
+tr = with_engine(NatEngine({"شقة في Salmiya": "Apartment in Salmia", "شقة في QXAXQ": "Apartment in QXAXQ"}))
+assert tr.field("شقة في السالمية", "ar", "en") == "Apartment in Salmiya"
 assert tw.STATS["protected_retry"] == 1
-tr = with_engine(NatEngine({"شقة في السالمية": "Apartment in Salmiya"}))
-assert tr.field("شقة في السالمية", "ar", "en") == "Apartment in Salmiya" and tw.STATS["natural_ok"] == 1
 print("ok 26 protected retry on glossary miss")
 
 # ---- 27. digit mismatch -> protected method, numbers as placeholders when needed
@@ -443,11 +453,40 @@ out = tr.field("Rent 450 per month.", "en", "ar")
 assert out == "الإيجار 450 شهريا." and tw.STATS["protected_retry"] == 1 and tw.STATS["num_retry"] == 1, (out, tw.STATS)
 print("ok 27 digit mismatch")
 
-# ---- 28. structure still protected in the natural first attempt
-tr = with_engine(NatEngine({"Visit QXAXQ now.": "زوروا QXAXQ الآن."}))
+# ---- 28. structure: edges peeled, the rest sent raw and verified
+assert tw.peel("QXAXQ  hello QXBXQ world QXCXQ \n") == ("QXAXQ  ", "hello QXBXQ world", " QXCXQ \n")
+assert tw.peel("QXAXQQXBXQ") == ("QXAXQQXBXQ", "", "") and tw.peel("plain text") == ("", "plain text", "")
+tr = with_engine(NatEngine({"Visit https://example.com now.": "زوروا https://example.com الآن."}))
 out = tr.field("Visit https://example.com now.", "en", "ar")
-assert out == "زوروا https://example.com الآن." and tw.STATS["natural_ok"] == 1, (out, tw.STATS)
-print("ok 28 structure protected")
+assert out == "زوروا https://example.com الآن." and tw.STATS["inline_ok"] == 1, (out, tw.STATS)
+html = "<p>Our <strong>bakery</strong> sells bread.</p>"
+tr = with_engine(NatEngine({"Our <strong>bakery</strong> sells bread.": "مخبزنا <strong>الخبز</strong> يبيع."}))
+out = tr.field(html, "en", "ar")
+assert out == "<p>مخبزنا <strong>الخبز</strong> يبيع.</p>" and tw.STATS["inline_ok"] == 1, (out, tw.STATS)
+assert tr.engine.calls == [["Our <strong>bakery</strong> sells bread."]]  # <p> and </p> never sent
+# a dropped inline tag: attempt 1 refused, the protected method takes over
+tr = with_engine(NatEngine(lambda t: "مخبز" if "<" in t else "مخبزنا " + " ".join(tw.PH_RE.findall(t)) + " يبيع."))
+out = tr.field(html, "en", "ar")
+assert tw.STATS["protected_retry"] == 1 and out.startswith("<p>") and out.endswith("</p>"), (out, tw.STATS)
+print("ok 28 structure raw, edges peeled")
+
+# phones: digits identical once spaces are removed; a changed digit is refused
+ph_src = "Call +965 2222 3333 now."
+tr = with_engine(NatEngine({ph_src: "اتصل +965 2222 3333 الآن."}))
+assert tr.field(ph_src, "en", "ar") == "اتصل +965 2222 3333 الآن." and tw.STATS["inline_ok"] == 1
+tr = with_engine(NatEngine({ph_src: "اتصل +9652222 3333 الآن."}))
+assert tr.field(ph_src, "en", "ar") == "اتصل +9652222 3333 الآن." and tw.STATS["inline_ok"] == 1
+tr = with_engine(NatEngine(lambda t: "اتصل +965 2222 3334 الآن." if "+965" in t else "اتصل QXAXQ الآن."))
+assert tr.field(ph_src, "en", "ar") == "اتصل +965 2222 3333 الآن." and tw.STATS["inline_ok"] == 0
+# adjacent <yk-keep> tags: byte-identical, in order, once each
+yk = 'Hello <yk-keep n="1"></yk-keep><yk-keep n="2"></yk-keep> world'
+tr = with_engine(NatEngine({yk: 'مرحبا <yk-keep n="1"></yk-keep><yk-keep n="2"></yk-keep> عالم'}))
+assert tr.field(yk, "en", "ar") == 'مرحبا <yk-keep n="1"></yk-keep><yk-keep n="2"></yk-keep> عالم'
+tr = with_engine(NatEngine(lambda t: 'مرحبا <yk-keep n="2"></yk-keep><yk-keep n="1"></yk-keep> عالم' if "<" in t
+                           else "مرحبا " + "".join(tw.PH_RE.findall(t)) + " عالم"))
+out = tr.field(yk, "en", "ar")  # swapped order refused, the protected method restores the right order
+assert 'n="1"></yk-keep><yk-keep n="2"' in out and tw.STATS["protected_retry"] == 1, (out, tw.STATS)
+print("ok 28b phones and yk-keep")
 
 
 class InventEngine(KeepEngine):
@@ -486,13 +525,13 @@ print("ok 31 numbers by value")
 
 # ---- 32. natural-first final choice: translation, natural output, or the whole source; never a mix
 src_t = "Rent 450 KWD per month."
-prot_t = "Rent 450 QXAXQ per month."
-tr = with_engine(NatEngine({src_t: "الإيجار 450 دولار شهريا.", prot_t: "الإيجار 450 QXAXQ شهريا."}))
+prot_t = P1
+tr = with_engine(NatEngine({S1: "الإيجار 450 دولار شهريا.", prot_t: "الإيجار 450 QXAXQ شهريا."}))
 assert tr.field(src_t, "en", "ar") == "الإيجار 450 دينار كويتي شهريا." and tw.STATS["glossary_miss"] == 0  # (ii)
-tr = with_engine(NatEngine({src_t: "الإيجار 450 دولار شهريا.", prot_t: "Rent QXAXQ monthly please"}))
-out = tr.field(src_t, "en", "ar")  # protected answer is not Arabic: (iii) natural output, glossary missed
+tr = with_engine(NatEngine({S1: "الإيجار 450 دولار شهريا.", prot_t: "Rent QXAXQ monthly please"}))
+out = tr.field(src_t, "en", "ar")  # protected answer is not Arabic: (iii) attempt 1, glossary missed
 assert out == "الإيجار 450 دولار شهريا." and tw.STATS["glossary_miss"] == 1 and tw.STATS["kept"] == 0, (out, tw.STATS)
-tr = with_engine(NatEngine({src_t: "الإيجار 40 دولار شهريا.", prot_t: "Rent QXAXQ monthly please"}))
+tr = with_engine(NatEngine({S1: "الإيجار 40 دولار شهريا.", prot_t: "Rent QXAXQ monthly please"}))
 out = tr.field(src_t, "en", "ar")  # numbers wrong AND protected unusable: (iv) the whole source piece
 assert out == src_t and tw.STATS["kept"] == 1 and "دينار" not in out, (out, tw.STATS)
 # a piece the protected path could only half translate is kept whole, glossary terms in their source form
@@ -506,7 +545,7 @@ tr = with_engine(NatEngine({"للبيع سيارة ماشية 120 ألف كم، 
                             "استعمال سنتين فقط، السعر 60 دينار": "Used for only 2 years, priced at 60 dinars"}))
 assert tr.field("للبيع سيارة ماشية 120 ألف كم، السعر 6,200 دينار", "ar", "en").startswith("Car for sale")
 assert tr.field("استعمال سنتين فقط، السعر 60 دينار", "ar", "en").startswith("Used for only 2")
-assert tw.STATS["natural_ok"] == 2 and tw.STATS["protected_retry"] == 0, tw.STATS
+assert tw.STATS["inline_ok"] == 2 and tw.STATS["protected_retry"] == 0, tw.STATS
 print("ok 33 harmless number rewrites")
 
 # ---- 34. YK_DEBUG lines (only with YK_DEBUG=1)
@@ -515,13 +554,134 @@ import io  # noqa: E402
 
 for flag, want in (("1", True), ("0", False)):
     os.environ["YK_DEBUG"] = flag
-    tr = with_engine(NatEngine({src_t: "الإيجار 450 دولار شهريا.", prot_t: "الإيجار 450 QXAXQ شهريا."}))
+    tr = with_engine(NatEngine({S1: "الإيجار 450 دولار شهريا.", prot_t: "الإيجار 450 QXAXQ شهريا."}))
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         tr.field(src_t, "en", "ar")
     text = buf.getvalue()
-    assert ("DEBUG natural rejected [glossary:دينار كويتي]" in text) == want, text
+    assert ("DEBUG attempt 1 (inline) rejected [glossary:دينار كويتي]" in text) == want, text
     assert ("DEBUG" in text) == want
 os.environ.pop("YK_DEBUG")
 print("ok 34 debug lines")
+
+
+# ---- 35. REST handling with a fake session
+class FakeResp:
+    def __init__(self, status, body):
+        self.status_code, self._body = status, body
+
+    def json(self):
+        if self._body is None:
+            raise ValueError("not json")
+        return self._body
+
+
+class FakeSession:
+    """Answers scripted per route; an entry can be an exception to raise. Records every call."""
+
+    def __init__(self, script):
+        self.script, self.calls = script, []
+
+    def request(self, method, url, timeout=None, **kw):
+        route = url.split("/yk-translate/v1")[1]
+        self.calls.append((method, route, kw))
+        item = self.script[route].pop(0) if len(self.script[route]) > 1 else self.script[route][0]
+        if isinstance(item, Exception):
+            raise item
+        return FakeResp(*item)
+
+
+def site_with(script):
+    site = tw.Site("https://example.test", "t")
+    site.http = FakeSession(script)
+    return site
+
+
+def reset_stats():
+    for k in tw.STATS:
+        tw.STATS[k] = type(tw.STATS[k])()
+
+
+JOB = {"job_id": 7, "post_id": 3, "target": "ar", "source": "en", "hash": "h1", "fields": {"title": "Hi"}}
+real_sleep = tw.time.sleep
+tw.time.sleep = lambda s: None
+try:
+    def run(script, fields=None):
+        reset_stats()
+        site = site_with(script)
+        return tw.deliver(site, JOB, "tgemma", fields or {"title": "مرحبا"}), site
+
+    res, site = run({"/result": [(200, {"ok": True, "already": True})]})
+    assert res == "done" and tw.STATS["done"] == 1
+    for code in ("yk_stale_hash", "yk_not_claimed", "yk_not_needed"):
+        res, site = run({"/result": [(409, {"code": code, "message": "m"})], "/fail": [(200, {})]})
+        assert res == "skipped" and tw.STATS["skipped"] == 1 and tw.STATS["failed"] == 0, code
+        assert [c[1] for c in site.http.calls] == ["/result"], site.http.calls  # no /fail
+    res, site = run({"/result": [(404, {"code": "yk_unknown_job"})], "/fail": [(200, {})]})
+    assert res == "skipped" and [c[1] for c in site.http.calls] == ["/result"]
+    # yk_busy: 3 posts at most, then dropped without /fail
+    res, site = run({"/result": [(409, {"code": "yk_busy"})], "/fail": [(200, {})]})
+    assert res == "skipped" and [c[1] for c in site.http.calls] == ["/result"] * 3 and tw.STATS["skipped"] == 1
+    res, site = run({"/result": [(409, {"code": "yk_busy"}), (200, {"ok": True})]})
+    assert res == "done" and len(site.http.calls) == 2
+    # the same body each time, hash and target as issued
+    bodies = [c[2]["json"] for c in site.http.calls]
+    assert bodies[0] == bodies[1] and bodies[0]["hash"] == "h1" and bodies[0]["target"] == "ar"
+    # codes that call /fail once
+    for status, code in ((422, "yk_protected_lost"), (422, "yk_missing_fields"), (413, "yk_too_large")):
+        res, site = run({"/result": [(status, {"code": code, "message": "bad"})], "/fail": [(200, {"ignored": True})]})
+        assert res == "failed" and tw.STATS["failed"] == 1, code
+        assert [c[1] for c in site.http.calls] == ["/result", "/fail"], site.http.calls
+        assert code in site.http.calls[1][2]["json"]["reason"]
+    # 5xx on /result: no retry, no /fail
+    res, site = run({"/result": [(500, {"code": "yk_write_failed"})], "/fail": [(200, {})]})
+    assert res == "failed" and tw.STATS["failed"] == 1 and [c[1] for c in site.http.calls] == ["/result"]
+    res, site = run({"/result": [(502, None)], "/fail": [(200, {})]})  # not JSON
+    assert res == "failed" and len(site.http.calls) == 1
+    # 401 / 403 are fatal on any route
+    for status, code in ((401, "rest_forbidden"), (403, "yk_no_secret"), (403, "yk_https_required")):
+        try:
+            run({"/result": [(status, {"code": code})]})
+            raise AssertionError("expected Fatal")
+        except tw.Fatal as e:
+            assert str(status) in str(e) and code in str(e)
+    try:
+        site_with({"/pending": [(403, {"code": "yk_no_secret"})]}).pending(5)
+        raise AssertionError("expected Fatal")
+    except tw.Fatal:
+        pass
+    # network error on /result: one re-POST, only after GET /pending?count_only=1 answered
+    res, site = run({"/result": [tw.requests.ConnectionError("x"), (200, {"already": True})],
+                     "/pending": [(200, {"pending": 2})]})
+    assert res == "done" and [c[1] for c in site.http.calls] == ["/result", "/pending", "/result"]
+    assert site.http.calls[1][2]["params"] == {"count_only": 1}
+    reset_stats()
+    site = site_with({"/result": [tw.requests.Timeout("x")], "/pending": [tw.requests.ConnectionError("x")]})
+    try:
+        tw.deliver(site, JOB, "tgemma", {"title": "x"})
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError:
+        pass
+    assert [c[1] for c in site.http.calls].count("/result") == 1  # site unreachable: no second POST
+    # 5xx on /pending is retried as before
+    site = site_with({"/pending": [(503, {}), (200, {"jobs": [JOB]})]})
+    assert site.pending(5) == [JOB]
+    # a lost <yk-keep> tag: /fail "protected lost locally", nothing posted
+    job = dict(JOB, fields={"body": 'A <yk-keep n="1"></yk-keep> B <yk-keep n="2"></yk-keep>'})
+    reset_stats()
+    site = site_with({"/result": [(200, {})], "/fail": [(200, {})]})
+    assert tw.deliver(site, job, "tgemma", {"body": 'أ <yk-keep n="1"></yk-keep> ب'}) == "failed"
+    assert [c[1] for c in site.http.calls] == ["/fail"] and site.http.calls[0][2]["json"]["reason"] == "protected lost locally"
+    reset_stats()
+    site = site_with({"/result": [(200, {})]})
+    ok_out = {"body": 'أ <yk-keep n="1"></yk-keep> ب <yk-keep n="2"></yk-keep>'}
+    assert tw.deliver(site, job, "tgemma", ok_out) == "done"
+finally:
+    tw.time.sleep = real_sleep
+
+# fields whose value is not a string pass through untouched
+tr = with_engine(KeepEngine())
+assert tr.field(5, "en", "ar") == 5 and tr.field(None, "en", "ar") is None and tr.field(["a"], "en", "ar") == ["a"]
+assert tr.field("", "en", "ar") == ""
+print("ok 35 REST handling")
 print("ALL TESTS PASSED")

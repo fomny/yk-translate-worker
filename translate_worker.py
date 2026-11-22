@@ -46,7 +46,7 @@ SENT_CAP = 400
 
 STATS = {"done": 0, "failed": 0, "chars": 0, "model_s": 0.0, "load_s": 0.0, "kept": 0, "split": 0,
          "num_retry": 0, "fmt_dropped": 0, "script_retry": 0, "len_reject": 0,
-         "natural_ok": 0, "protected_retry": 0, "glossary_miss": 0}
+         "inline_ok": 0, "protected_retry": 0, "glossary_miss": 0, "skipped": 0}
 GLOSS = {}  # source language -> (compiled regex, lookup); filled by load_glossary()
 
 
@@ -72,6 +72,80 @@ class Items(list):
     def __init__(self, *a):
         super().__init__(*a)
         self.orig = {}
+
+
+def _is_phone(item):
+    m = PROTECT_RE.fullmatch(item)
+    return bool(m and m.group("phone"))
+
+
+def strip_raws(text, raws):
+    """text with every raw structural item replaced by a space (phones also when re-spaced)."""
+    for r in sorted(set(raws), key=len, reverse=True):
+        if _is_phone(r):
+            compact = re.sub(r"\s+", "", r)
+            text = re.sub(r"\s*".join(re.escape(c) for c in compact), " ", text)
+        else:
+            text = text.replace(r, " ")
+    return text
+
+
+def structure_ok(raws, o):
+    """Each structural item is in the output byte-identical, as often as in the source and in the same
+    relative order. Phones: digits identical as a string once spaces are removed."""
+    plain = [r for r in raws if not _is_phone(r)]
+    pos = 0
+    for r in plain:
+        i = o.find(r, pos)
+        if i < 0:
+            return False
+        pos = i + len(r)
+    masked = o
+    for r in sorted(set(plain), key=len, reverse=True):  # longest first: a URL inside a longer URL
+        if masked.count(r) != plain.count(r):
+            return False
+        masked = masked.replace(r, "\x00")
+    phones = [re.sub(r"\s+", "", r) for r in raws if _is_phone(r)]
+    o2, pos = re.sub(r"\s+", "", o), 0
+    for r in phones:
+        i = o2.find(r, pos)
+        if i < 0:
+            return False
+        pos = i + len(r)
+    return all(o2.count(r) == phones.count(r) for r in set(phones))
+
+
+def fix_digits(o, raws):
+    """Arabic-Indic digits to 0-9 everywhere except inside raw structural items."""
+    keep = sorted(set(raws), key=len, reverse=True)
+    for i, r in enumerate(keep):
+        o = o.replace(r, f"\x00{i}\x00")
+    o = o.translate(DIGIT_MAP)
+    for i, r in enumerate(keep):
+        o = o.replace(f"\x00{i}\x00", r)
+    return o
+
+
+def peel(s):
+    """-> (lead, core, trail): the structural placeholders (and whitespace) at both ends of a piece."""
+    pos = 0
+    while True:
+        p2 = len(s) - len(s[pos:].lstrip())
+        pm = PH_RE.match(s, p2)
+        if not pm:
+            pos = p2
+            break
+        pos = pm.end()
+    end = len(s)
+    ms = list(PH_RE.finditer(s))
+    while True:
+        e2 = len(s[:end].rstrip())
+        pm = next((m for m in reversed(ms) if m.end() == e2 and m.start() >= pos), None)
+        if not pm:
+            end = max(e2, pos)
+            break
+        end = pm.start()
+    return s[:pos], s[pos:end], s[end:]
 
 
 def unglossary(piece, items):
@@ -398,9 +472,10 @@ def load_glossary(path):
     return n
 
 
-def apply_glossary(prot, items, src, tgt):
-    """Replace times (en->ar) and glossary terms by protected items holding the other language's form."""
-    if (src, tgt) == ("en", "ar"):
+def apply_glossary(prot, items, src, tgt, inline=False):
+    """Replace times (en->ar) and glossary terms by protected items holding the other language's form.
+    inline=True: write the target-language form into the text itself (no placeholder, no times)."""
+    if (src, tgt) == ("en", "ar") and not inline:
         def tsub(m):
             val = _time_value(m)
             if val is None:
@@ -426,6 +501,8 @@ def apply_glossary(prot, items, src, tgt):
                 val, pre = ll_map[_norm_ar(m.group("rest"))], AR_PRE["ل"]
             else:
                 val, pre = ar_map[_norm_ar(m.group("form"))], AR_PRE.get(m.group("pre") or "", "")
+        if inline:
+            return pre + val
         items.append(val)
         rep = pre + ph(len(items) - 1)
         getattr(items, "orig", {})[rep] = m.group(0)
@@ -759,18 +836,22 @@ class Translator:
     def _sentences(t):
         return [m.group(2).strip() for m in SENT_RE.finditer(t) if m.group(2).strip()]
 
-    def _insane(self, t, o, tgt, count=True):
+    def _insane(self, t, o, tgt, count=True, ref=None, strip=()):
         """Why an output is rejected ("script" / "length") or None. Source-verbatim tokens (brands,
-        units) and placeholders do not count against the target script."""
+        units) and placeholders do not count against the target script. ref: the original source text
+        when t (what was sent) holds inlined target-language terms; strip: raw structural items to
+        ignore in o."""
         eng = self.engine
         if eng.script_check:
-            known = {w.lower() for w in re.findall(r"[^\W\d_]+", PH_RE.sub(" ", t))}
-            rest = " ".join(w for w in re.findall(r"[^\W\d_]+", PH_RE.sub(" ", o)) if w.lower() not in known)
+            base = t if ref is None else ref
+            o_s = strip_raws(o, strip) if strip else o
+            known = {w.lower() for w in re.findall(r"[^\W\d_]+", PH_RE.sub(" ", base))}
+            rest = " ".join(w for w in re.findall(r"[^\W\d_]+", PH_RE.sub(" ", o_s)) if w.lower() not in known)
             ar, lat = len(AR_RE.findall(rest)), len(LAT_RE.findall(rest))
             bad = bool(ar + lat) and not (ar > lat if tgt == "ar" else lat > ar)
             if not ar + lat:  # nothing new: an echo of a real sentence is a failure, a brand name is not
                 norm = lambda x: " ".join(PH_RE.sub(" ", x).lower().split())  # noqa: E731
-                bad = len(norm(o).split()) >= 4 and norm(o) == norm(t)
+                bad = len(norm(o_s).split()) >= 4 and norm(o_s) == norm(base)
             if bad:
                 if count:
                     STATS["script_retry"] += 1
@@ -790,62 +871,87 @@ class Translator:
             and not items[i].lower().startswith(("<yk-keep", "</yk-keep"))
             for i in ids)
 
-    def _natural_issues(self, s, o, src, tgt):
-        """Names of the checks a natural answer fails (empty list: accept)."""
+    def _prepare(self, s, src, tgt, items):
+        """Attempt 1 for a natural_first engine: peel the structural items off both ends of the piece,
+        write glossary terms in the target language inside the core, send structure raw."""
+        lead, core, trail = peel(s)
+        sent_ph = apply_glossary(core, items, src, tgt, inline=True)
+        raws = []
+
+        def raw(m):
+            i = int("".join(str(LETTERS.index(c.upper())) for c in m.group(1)))
+            if i >= len(items):
+                return m.group(0)
+            raws.append(items[i])
+            return items[i]
+
+        sent = PH_RE.sub(raw, sent_ph)
+        rx = LAT_RE if src == "en" else AR_RE
+        need = bool(rx.search(strip_raws(sent, raws)))  # nothing of the source language left: no call
+        return {"lead": lead, "trail": trail, "core": core, "sent": sent, "raws": raws, "need": need}
+
+    def _verify1(self, p, o, src, tgt):
+        """Names of the checks an attempt-1 answer fails (empty list: accept)."""
         if not o:
             return ["empty"]
-        out = []
-        if ph_ids(o) != ph_ids(s):
-            out.append("placeholders")
-        why = self._insane(s, o, tgt, count=False)
+        bad = []
+        if PH_RE.search(o):
+            bad.append("placeholders")
+        if not structure_ok(p["raws"], o):
+            bad.append("structure")
+        why = self._insane(p["sent"], o, tgt, count=False, ref=p["core"], strip=p["raws"])
         if why:
-            out.append(why)
-        if number_values(s) and not numbers_ok(s, o):
-            out.append("digits")
-        out += ["glossary:" + f for f in gloss_missing(s, o, src, tgt)]
-        return out
+            bad.append(why)
+        o_s = strip_raws(o, p["raws"])
+        if number_values(p["core"]) and not numbers_ok(p["core"], o_s):
+            bad.append("digits")
+        return bad + ["glossary:" + f for f in gloss_missing(p["core"], o_s, src, tgt)]
 
     def _run(self, pieces, src, tgt, items):
         """-> {piece: result}. Never a mix of source and translation inside one piece.
-        natural_first engines: (i) the natural answer if it passes every check; else (ii) the protected
-        answer if it has no kept segment; else (iii) the natural answer when only the glossary check
-        failed (STATS["glossary_miss"]); else (iv) the whole source piece (STATS["kept"])."""
-        natural = self.engine.natural_first
-        done, redo, issues, nat_out = {}, {}, {}, {}
-        if natural:
-            for s, o in self._batches(pieces, src, tgt).items():
-                bad = self._natural_issues(s, o, src, tgt)
-                if not bad:
-                    done[s] = o.translate(DIGIT_MAP)
-                    STATS["natural_ok"] += 1
-                else:
-                    issues[s], nat_out[s] = bad, o
-                    redo[s] = apply_glossary(s, items, src, tgt)
-                    dbg(f"natural rejected [{', '.join(bad)}] src={cut(s)!r} out={cut(o)!r}")
-            todo = sorted({v for v in redo.values() if needs_model(v)}, key=len)
-            STATS["protected_retry"] += len(redo)
-        else:
-            todo = pieces
-        res = self._run_protected(todo, src, tgt, items) if todo else {}
-        if not natural:
+        natural_first engines: attempt 1 = peeled core, glossary written inline, structure raw (accepted
+        when every check passes, STATS["inline_ok"]); attempt 2 = the protected method
+        (STATS["protected_retry"]); if that has a kept segment: the attempt-1 answer when only the
+        glossary check failed (STATS["glossary_miss"]), else the whole source piece (STATS["kept"])."""
+        if not self.engine.natural_first:
+            res = self._run_protected(pieces, src, tgt, items) if pieces else {}
             for s in pieces:
                 if s in self._tainted:
                     res[s] = unglossary(s, items)  # the whole source piece, not half of it
                     STATS["kept"] += 1
             return res
+        done, redo, issues, att1 = {}, {}, {}, {}
+        preps = {s: self._prepare(s, src, tgt, items) for s in pieces}
+        outs = self._batches([p["sent"] for p in preps.values() if p["need"]], src, tgt)
+        for s, p in preps.items():
+            o = outs[p["sent"]] if p["need"] else p["sent"]
+            bad = self._verify1(p, o, src, tgt) if p["need"] else []
+            if not bad:
+                done[s] = p["lead"] + fix_digits(o, p["raws"]) + p["trail"]
+                STATS["inline_ok"] += 1
+                continue
+            issues[s] = bad
+            att1[s] = p["lead"] + fix_digits(o, p["raws"]) + p["trail"]
+            redo[s] = apply_glossary(p["core"], items, src, tgt)
+            dbg(f"attempt 1 (inline) rejected [{', '.join(bad)}] src={cut(s)!r} out={cut(o)!r}")
+        STATS["protected_retry"] += len(redo)
+        res = self._run_protected(sorted({v for v in redo.values() if needs_model(v)}, key=len),
+                                  src, tgt, items) if redo else {}
         for s, v in redo.items():
+            p = preps[s]
             if not needs_model(v):
-                done[s] = v
+                done[s] = p["lead"] + v + p["trail"]
             elif v in res and v not in self._tainted:
-                done[s] = res[v]                                   # (ii)
+                done[s] = p["lead"] + res[v] + p["trail"]            # attempt 2
             elif all(b.startswith("glossary:") for b in issues[s]):
-                done[s] = nat_out[s].translate(DIGIT_MAP)            # (iii)
+                done[s] = att1[s]                                  # attempt 1, glossary missed
                 STATS["glossary_miss"] += 1
                 dbg(f"glossary miss accepted: {issues[s]} src={cut(s)!r}")
             else:
-                done[s] = s                                        # (iv)
+                done[s] = s                                        # the whole source piece
                 STATS["kept"] += 1
                 log(f"piece kept untranslated (no complete translation): {cut(s, 60)!r}")
+                dbg(f"attempt 2 (protected) failed too; attempt 1 had {issues[s]}")
         return done
 
     def _run_protected(self, pieces, src, tgt, items):
@@ -932,35 +1038,111 @@ class Site:
         self.http = requests.Session()
         self.http.headers.update({"X-YK-Token": token, "User-Agent": "yk-translate-worker/1.0"})
 
-    def call(self, method, path, **kw):
+    def call(self, method, path, retry_5xx=True, retries=3, **kw):
+        """-> (status, body dict). Network errors and timeouts are retried (`retries` times); 5xx too
+        when retry_5xx. 401 and 403 are fatal. Other statuses are returned for the caller to read: the
+        error `code` of a WordPress REST error is in body["code"]."""
         last = ""
-        for attempt in range(4):  # first try + 3 retries
+        for attempt in range(retries + 1):
             try:
                 r = self.http.request(method, self.base + path, timeout=30, **kw)
             except (requests.ConnectionError, requests.Timeout) as e:
                 last = f"network error ({type(e).__name__})"
             else:
-                if r.status_code == 401:
-                    raise Fatal("HTTP 401: the site rejected the worker token (check YK_WORKER_TOKEN).")
-                if r.status_code < 500:
-                    r.raise_for_status()
-                    return r.json()
+                try:
+                    body = r.json()
+                except ValueError:
+                    body = {}
+                if not isinstance(body, dict):
+                    body = {"_list": body}
+                if r.status_code in (401, 403):
+                    code = str(body.get("code", ""))
+                    why = ("the site rejected the worker token (check YK_WORKER_TOKEN)" if r.status_code == 401
+                           else "the site has no worker token configured, or the request was not HTTPS "
+                                "(check YK_SITE_URL and the site's worker token setting)")
+                    raise Fatal(f"HTTP {r.status_code} {code}: {why}".replace("  ", " "))
+                if r.status_code < 500 or not retry_5xx:
+                    return r.status_code, body
                 last = f"HTTP {r.status_code}"
-            if attempt < 3:
+            if attempt < retries:
                 time.sleep(2 * 2 ** attempt)
         raise RuntimeError(f"{method} {path} failed after retries: {last}")
 
     def pending(self, limit):
-        data = self.call("GET", "/pending", params={"limit": limit})
-        return data.get("jobs", []) if isinstance(data, dict) else data
+        status, data = self.call("GET", "/pending", params={"limit": limit})
+        if status >= 400:
+            raise RuntimeError(f"GET /pending failed: HTTP {status} {data.get('code', '')}")
+        return data.get("jobs", []) if "_list" not in data else data["_list"]
 
     def result(self, job, engine, fields):
-        return self.call("POST", "/result", json={
-            "job_id": job["job_id"], "post_id": job["post_id"], "target": job["target"],
-            "hash": job.get("hash", ""), "engine": engine, "fields": fields})
+        """-> (status, body). A 5xx is returned, not retried: the site records that failure itself.
+        After a network error or timeout the identical body is posted once more, but only after
+        GET /pending?count_only=1 answered (the site answers 200 "already" if the first POST landed)."""
+        body = {"job_id": job["job_id"], "post_id": job["post_id"], "target": job["target"],
+                "hash": job.get("hash", ""), "engine": engine, "fields": fields}
+        try:
+            return self.call("POST", "/result", retry_5xx=False, retries=0, json=body)
+        except RuntimeError:
+            self.call("GET", "/pending", params={"count_only": 1})
+            return self.call("POST", "/result", retry_5xx=False, retries=0, json=body)
 
     def fail(self, job_id, reason):
         return self.call("POST", "/fail", json={"job_id": job_id, "reason": reason})
+
+
+KEEP_TAG_RE = re.compile(r"</?yk-keep\b[^<>]*>")
+
+
+def keep_tags_ok(job_fields, out_fields):
+    """Every <yk-keep ...> / </yk-keep> tag of each text field comes back exactly as often as it was sent."""
+    for k, v in job_fields.items():
+        o = out_fields.get(k)
+        if isinstance(v, str) and isinstance(o, str):
+            a, b = KEEP_TAG_RE.findall(v), KEEP_TAG_RE.findall(o)
+            if sorted(a) != sorted(b):
+                return False
+    return True
+
+
+def deliver(site, job, engine_name, fields):
+    """Post a result and handle the answer. -> "done" | "skipped" | "failed"."""
+    if not keep_tags_ok(job.get("fields", {}), fields):
+        STATS["failed"] += 1
+        log(f"job {job['job_id']}: a <yk-keep> tag was lost locally; not posting")
+        try:
+            site.fail(job["job_id"], "protected lost locally")
+        except Fatal:
+            raise
+        except Exception as e:
+            log(f"could not report failure: {type(e).__name__}")
+        return "failed"
+    for attempt in range(3):  # yk_busy: wait and post the same body again, 3 posts at most
+        status, body = site.result(job, engine_name, fields)
+        code, msg = str(body.get("code", "")), str(body.get("message", ""))
+        if not (status == 409 and code == "yk_busy" and attempt < 2):
+            break
+        log(f"job {job['job_id']}: site busy, waiting 5 s")
+        time.sleep(5)
+    if 200 <= status < 300:  # also {"already": true}
+        STATS["done"] += 1
+        return "done"
+    if status == 409 or (status == 404 and code == "yk_unknown_job"):
+        STATS["skipped"] += 1
+        log(f"job {job['job_id']} dropped ({code or 'HTTP ' + str(status)}); no /fail")
+        return "skipped"
+    STATS["failed"] += 1
+    if status >= 500:  # the site has recorded the failure itself
+        log(f"job {job['job_id']}: site answered HTTP {status} {code}; not retried, not reported")
+    else:
+        reason = f"{code}: {msg}"[:300] if code else f"HTTP {status}"
+        log(f"job {job['job_id']} refused by the site (HTTP {status}): {reason}")
+        try:
+            site.fail(job["job_id"], reason)  # once; {"ignored": true} is fine
+        except Fatal:
+            raise
+        except Exception as e:
+            log(f"could not report failure: {type(e).__name__}")
+    return "failed"
 
 
 # ---------------------------------------------------------------- main
@@ -1023,7 +1205,7 @@ def selftest(tr):
     for text, s, t in (("Hello", "en", "ar"), ("مرحبا", "ar", "en")):  # warm-up, not counted
         tr.field(text, s, t)
     for k in ("chars", "model_s", "kept", "split", "num_retry", "fmt_dropped", "script_retry", "len_reject",
-              "natural_ok", "protected_retry", "glossary_miss"):
+              "inline_ok", "protected_retry", "glossary_miss"):
         STATS[k] = type(STATS[k])()
     for text, s, t in SAMPLES:
         out = tr.field(text, s, t)
@@ -1037,8 +1219,8 @@ def summary(wall):
         f"pieces split at placeholders: {STATS['split']}  segments kept untranslated: {STATS['kept']}  "
         f"num_retry: {STATS['num_retry']}  fmt_dropped: {STATS['fmt_dropped']}  "
         f"script_retry: {STATS['script_retry']}  len_reject: {STATS['len_reject']}  "
-        f"natural_ok: {STATS['natural_ok']}  protected_retry: {STATS['protected_retry']}  "
-        f"glossary_miss: {STATS['glossary_miss']}")
+        f"inline_ok: {STATS['inline_ok']}  protected_retry: {STATS['protected_retry']}  "
+        f"glossary_miss: {STATS['glossary_miss']}  skipped: {STATS['skipped']}")
     log(f"characters translated: {STATS['chars']}  seconds loading model: {STATS['load_s']:.1f}  "
         f"seconds in translate_batch: {STATS['model_s']:.1f}  chars/sec: {cps:.1f}  wall seconds: {wall:.1f}")
 
@@ -1090,9 +1272,8 @@ def main():
                 try:
                     src, tgt = job["source"], job["target"]
                     fields = {k: tr.field(v, src, tgt) for k, v in job["fields"].items()}
-                    site.result(job, engine.name, fields)
-                    STATS["done"] += 1
-                    log(f"job {job['job_id']} (post {job['post_id']}, {src}->{tgt}) done")
+                    if deliver(site, job, engine.name, fields) == "done":
+                        log(f"job {job['job_id']} (post {job['post_id']}, {src}->{tgt}) done")
                 except Fatal:
                     raise
                 except Exception as e:  # one bad job must not stop the run

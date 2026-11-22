@@ -1,7 +1,7 @@
 [
   {"en": ["Kuwait City", "Kuwait Capital City"], "ar": ["مدينة الكويت"], "ar_ok": ["مدينة الكويت", "العاصمة"], "ar_ambiguous": false},
   {"en": ["Kuwait"], "ar": ["الكويت"], "ar_ambiguous": false},
-  {"en": ["KNET", "K-Net"], "ar": ["كي نت", "كينت", "الكي نت", "الكينت"], "ar_ambiguous": false},
+  {"en": ["KNET", "K-Net"], "en_ok": ["K-Net", "Knet"], "ar": ["كي نت", "كينت", "الكي نت", "الكينت"], "ar_ambiguous": false},
   {"en": ["Al Asimah", "Asimah"], "ar": ["العاصمة"], "ar_ambiguous": true},
   {"en": ["Hawally", "Hawalli"], "ar": ["حولي"], "ar_ambiguous": false},
   {"en": ["Farwaniya", "Farwaniyah", "Al Farwaniya", "Al Farwaniyah"], "ar": ["الفروانية"], "ar_ambiguous": false},
