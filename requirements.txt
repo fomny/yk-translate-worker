@@ -1,5 +1,5 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
-ctranslate2==4.5.0
+ctranslate2==4.6.3
 transformers==4.46.3
 huggingface_hub==0.26.2
 sentencepiece==0.2.0
