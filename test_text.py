@@ -4,6 +4,7 @@ Run:  python -I test_text.py
 """
 import json
 import os
+import re
 import sys
 import types
 
@@ -50,7 +51,7 @@ class EmptyEngine(KeepEngine):
 
 
 def fresh(engine_cls=KeepEngine):
-    for k in ("chars", "model_s", "load_s", "kept", "split"):
+    for k in ("chars", "model_s", "load_s", "kept", "split", "num_retry", "fmt_dropped"):
         tw.STATS[k] = type(tw.STATS[k])()
     eng = engine_cls()
     return tw.Translator(eng, 16), eng
@@ -78,7 +79,10 @@ for c in cases:
     assert protected(c) == [c], (c, protected(c))
     prot, items = tw.protect(c)
     assert tw.restore(prot, items) == c
-assert protected("50% off and 20% more") == ["50", "20"]  # a lone % is not a variable
+assert protected("50% off and 20% more") == []  # plain numbers go to the model; a lone % is no variable
+assert protected("3 - 5 rooms, 2018, 11:00, 85,000 km, 9,500 KWD") == []
+assert protected("Call 5555 1234 now") == ["5555 1234"]  # 8 digits: phone-like
+assert protected("ring 22 33 44 55") == ["22 33 44 55"]
 print("ok 1 protect classes")
 
 # ---- 2. fallback split keeps every protected item, in order, batched
@@ -182,4 +186,100 @@ tr, eng = fresh(KeepEngine)
 assert tr.field("Shop in Salmiya", "en", "ar") == "T{Shop in Salmiya}"
 print("ok 11 no glossary")
 
+tw.load_glossary(os.path.join(HERE, "glossary.json"))
+
+
+class ArabicDigitsEngine(KeepEngine):
+    def translate(self, texts, src, tgt):
+        self.calls.append(list(texts))
+        return [t.translate(str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩")) for t in texts]
+
+
+class NumMangleEngine(KeepEngine):
+    """Strips digits from plain text; copies placeholders when they are present."""
+    drop_ph = False
+
+    def translate(self, texts, src, tgt):
+        self.calls.append(list(texts))
+        out = []
+        for t in texts:
+            if "QX" in t:
+                out.append(tw.PH_RE.sub("", t) if self.drop_ph else t)
+            else:
+                out.append(re.sub(r"\d", "", t) if re.search(r"\d", t) else "T{" + t + "}")
+        return out
+
+
+class NumMangleDropEngine(NumMangleEngine):
+    drop_ph = True
+
+
+# ---- 12. plain numbers reach the model unprotected; verified; written 0-9
+tr, eng = fresh(KeepEngine)
+out = tr.field("Price 9,500 for the 2018 model", "en", "ar")
+assert eng.calls == [["Price 9,500 for the 2018 model"]] and out == "T{Price 9,500 for the 2018 model}", (eng.calls, out)
+assert tw.STATS["num_retry"] == 0
+tr, eng = fresh(ArabicDigitsEngine)
+out = tr.field("Price 9,500 for the 2018 model", "en", "ar")
+assert out == "Price 9,500 for the 2018 model" and tw.STATS["num_retry"] == 0, out
+print("ok 12 plain numbers verified, western digits")
+
+# ---- 13. digit mismatch -> numbers protected and redone
+tr, eng = fresh(NumMangleEngine)
+out = tr.field("Price 9,500 for 2018", "en", "ar")
+assert out == "Price 9,500 for 2018" and tw.STATS["num_retry"] == 1 and tw.STATS["split"] == 0, (out, tw.STATS)
+tr, eng = fresh(NumMangleDropEngine)  # the redo also loses placeholders: split around the numbers
+out = tr.field("Price 9,500 for 2018", "en", "ar")
+assert out == "T{Price} 9,500 T{for} 2018" and tw.STATS["num_retry"] == 1 and tw.STATS["split"] == 1, (out, tw.STATS)
+print("ok 13 number retry and split")
+
+# ---- 14. times, English -> Arabic only
+tr, eng = fresh(KeepEngine)
+out = tr.field("Open 11:00 am to 11:00 pm, 12 pm, 12 am, 7:30PM and 5 p.m. daily.", "en", "ar")
+for want in ("11:00 صباحاً", "11:00 مساءً", "12 ظهراً", "12 منتصف الليل", "7:30 مساءً", "5 مساءً"):
+    assert want in out, (want, out)
+assert " am" not in out and "pm" not in out.lower()
+assert "13 pm" in tr.field("Closes at 13 pm sharp", "en", "ar")  # not a valid 12-hour time: untouched
+tr, eng = fresh(KeepEngine)
+o = tr.field("نفتح 11:00 am", "ar", "en")
+assert "11:00 am" in o and "صباحاً" not in o
+print("ok 14 times")
+
+# ---- 15. inline formatting tags: dropped for one sentence, links and block tags never
+tr, eng = fresh(DropEngine)
+out = tr.field("Our <strong>bakery</strong> bakes bread.", "en", "ar")
+assert out == "T{Our bakery bakes bread.}" and tw.STATS["fmt_dropped"] == 1 and tw.STATS["split"] == 0, (out, tw.STATS)
+tr, eng = fresh(DropEngine)
+src = 'Visit our <a href="https://x.com/m">full menu</a> now.'
+out = tr.field(src, "en", "ar")
+assert protected(out) == protected(src) and tw.STATS["fmt_dropped"] == 0 and tw.STATS["split"] == 1, (out, tw.STATS)
+tr, eng = fresh(DropEngine)
+src = "<p>Some <em>text</em> here</p>"
+out = tr.field(src, "en", "ar")
+assert out.startswith("<p>") and out.endswith("</p>") and tw.STATS["fmt_dropped"] == 0
+print("ok 15 inline tags")
+
+# ---- 16. adjacent <yk-keep> tags survive, in order, byte-identical
+src = 'Hello <yk-keep n="1"></yk-keep><yk-keep n="2"></yk-keep> world'
+for cls in (KeepEngine, DropEngine):
+    tr, eng = fresh(cls)
+    out = tr.field(src, "en", "ar")
+    assert '<yk-keep n="1"></yk-keep><yk-keep n="2"></yk-keep>' in out, (cls.__name__, out)
+    assert protected(out) == protected(src) and tw.STATS["fmt_dropped"] == 0
+print("ok 16 yk-keep")
+
+# ---- 17. glossary additions
+tr, eng = fresh(KeepEngine)
+out = tr.field("Rent 350 KD, 120 sqm, A/C, near Samsung and iPhone shops; Toyota Land Cruiser, Nissan Patrol.", "en", "ar")
+for want in ("350", "دينار كويتي", "متر مربع", "تكييف", "سامسونج", "آيفون", "تويوتا لاند كروزر", "نيسان باترول"):
+    assert want in out, (want, out)
+o = tr.field("للبيع نيسان باترول وغسالة سامسونج و تويوتا لاند كروزر", "ar", "en")
+assert "Nissan Patrol" in o and "Samsung" in o and "Toyota Land Cruiser" in o, o
+o = tr.field("دينار كويتي وتكييف", "ar", "en")  # abbreviations are English -> Arabic only
+assert "KD" not in o and "KWD" not in o and "A/C" not in o, o
+print("ok 17 glossary additions")
+
+assert "m2m100-big" in tw.ENGINES and tw.ENGINES["m2m100-big"].MODEL == "facebook/m2m100_1.2B"
+assert tw.ENGINES["m2m100"].MODEL == "facebook/m2m100_418M"
+print("ok 18 engines")
 print("ALL TESTS PASSED")

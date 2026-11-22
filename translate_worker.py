@@ -3,7 +3,7 @@
 
 Pulls pending jobs over HTTPS, translates Arabic <-> English with an open
 model on CPU (CTranslate2), posts the results back. No vendor API, no cap.
-Env: YK_SITE_URL, YK_WORKER_TOKEN, YK_ENGINE (opus|m2m100), YK_MODEL_DIR,
+Env: YK_SITE_URL, YK_WORKER_TOKEN, YK_ENGINE (opus|m2m100|m2m100-big), YK_MODEL_DIR,
 YK_BATCH, YK_LIMIT, YK_MAX_MINUTES, YK_GLOSSARY (path of glossary.json).
 Flags: --selftest, --engine, --limit.
 """
@@ -21,14 +21,21 @@ import requests
 AR_RE = re.compile(r"[؀-ۿݐ-ݿﭐ-﷿ﹰ-﻿]")
 LAT_RE = re.compile(r"[A-Za-z]")
 LETTER_RE = re.compile(r"[^\W\d_]")
-# Items kept verbatim: HTML tags/comments, shortcodes, %variables%, URLs, e-mails,
-# phone numbers, numbers.
+# Items kept verbatim: HTML tags/comments, shortcodes, %variables%, URLs, e-mails and
+# phone-like numbers (7+ digits). Plain numbers (prices, years, times) go to the model
+# and are verified afterwards (see Translator._checked).
 PROTECT_RE = re.compile(
     r"<!--.*?-->|</?[A-Za-z][^<>]*>|\[/?[A-Za-z][^\[\]]*\]|%[A-Za-z0-9_]+%"
     r"|(?:https?://|www\.)[^\s<>\"']+"
-    r"|[\w.+-]+@[\w-]+(?:\.[\w-]+)+|\+?\d[\d\s().\-]{6,}\d|\d+(?:[.,٫٬]\d+)*",
+    r"|[\w.+-]+@[\w-]+(?:\.[\w-]+)+|(?P<phone>\+?\d[\d\s().\-]{6,}\d)",
     re.S,
 )
+NUM_RE = re.compile(r"\d+(?:[.,٫٬]\d+)*")
+DIGIT_MAP = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+# Formatting tags that may be dropped from one sentence. Block tags, <yk-keep> and
+# anything else are never in this list. Links (<a>) are excluded again in _droppable.
+INLINE_RE = re.compile(r"</?(?:strong|b|em|i|u|span|a)(?=[\s>/])[^<>]*>", re.I)
+TIME_RE = re.compile(r"(?<![\w:.])(\d{1,2})(?::(\d{2}))?\s*([ap])(?:\.m\.?|m)(?![A-Za-z])", re.I)
 # Placeholder: plain Latin letters only (digits become A-J), so the SentencePiece
 # vocabularies know the characters and the model tends to copy it as is.
 LETTERS = "ABCDEFGHIJ"
@@ -36,7 +43,8 @@ PH_RE = re.compile(r"QX\s*([A-J]+)\s*XQ", re.I)
 SENT_RE = re.compile(r"(\s*)([^.!?؟؛]*[.!?؟؛]+|[^.!?؟؛]+)(\s*)")
 SENT_CAP = 400
 
-STATS = {"done": 0, "failed": 0, "chars": 0, "model_s": 0.0, "load_s": 0.0, "kept": 0, "split": 0}
+STATS = {"done": 0, "failed": 0, "chars": 0, "model_s": 0.0, "load_s": 0.0, "kept": 0, "split": 0,
+         "num_retry": 0, "fmt_dropped": 0}
 GLOSS = {}  # source language -> (compiled regex, lookup); filled by load_glossary()
 
 
@@ -54,6 +62,8 @@ def protect(text):
 
     def sub(m):
         s, tail = m.group(0), ""
+        if m.group("phone") and sum(c.isdigit() for c in s) < 7:
+            return s  # not phone-like: leave it to the model
         if s.lower().startswith(("http", "www")):
             core = s.rstrip(".,;:!?)،؛؟")
             tail, s = s[len(core):], core
@@ -69,6 +79,19 @@ def restore(text, items):
         return items[i] if i < len(items) else m.group(0)
 
     return PH_RE.sub(sub, text)
+
+
+def digit_runs(s):
+    return sorted(re.findall(r"\d+", s.translate(DIGIT_MAP)))
+
+
+def protect_numbers(piece, items):
+    """Old way: every plain number in the piece becomes a placeholder."""
+    def sub(m):
+        items.append(m.group(0))
+        return ph(len(items) - 1)
+
+    return NUM_RE.sub(sub, piece)
 
 
 def ph_ids(s):
@@ -145,19 +168,15 @@ def split_at_ph(piece):
     return parts
 
 
-def join_parts(parts):
-    out = ""
-    for p in parts:
-        p = p.strip()
-        if not p:
-            continue
-        if not out:
-            out = p
-        elif p[0] in ".,;:!?)،؛؟":
-            out += p
-        else:
-            out += " " + p
-    return out
+def _time_value(m):
+    """'11:00 am' -> '11:00 صباحاً'; 12 pm -> '12 ظهراً'; 12 am -> '12 منتصف الليل'; None if not a time."""
+    h, mi = int(m.group(1)), m.group(2)
+    if not 1 <= h <= 12 or (mi is not None and int(mi) > 59):
+        return None
+    digits = m.group(1) + (":" + mi if mi else "")
+    pm = m.group(3).lower() == "p"
+    word = ("ظهراً" if h == 12 else "مساءً") if pm else ("منتصف الليل" if h == 12 else "صباحاً")
+    return f"{digits} {word}"
 
 
 # ---------------------------------------------------------------- glossary
@@ -216,7 +235,7 @@ def load_glossary(path):
         GLOSS["en"] = (re.compile(r"(?<![A-Za-z0-9])(?:" + alt + r")(?![A-Za-z0-9])", re.I), en_map)
     if ar_map:
         def alt_ar(keys):
-            return "|".join(r"\s+".join(re.escape(w) for w in k.split(" "))
+            return "|".join("[  ]+".join(re.escape(w) for w in k.split(" "))
                             for k in sorted(keys, key=len, reverse=True))
         core = r"(?P<pre>[بلوفك])?(?P<form>" + alt_ar(ar_map) + r")"
         if ll_map:
@@ -226,7 +245,16 @@ def load_glossary(path):
 
 
 def apply_glossary(prot, items, src, tgt):
-    """Replace glossary terms by protected items whose value is the other language's form."""
+    """Replace times (en->ar) and glossary terms by protected items holding the other language's form."""
+    if (src, tgt) == ("en", "ar"):
+        def tsub(m):
+            val = _time_value(m)
+            if val is None:
+                return m.group(0)
+            items.append(val)
+            return ph(len(items) - 1)
+
+        prot = TIME_RE.sub(tsub, prot)
     g = GLOSS.get(src)
     if not g or {src, tgt} != {"en", "ar"}:
         return prot
@@ -279,7 +307,8 @@ class CT2Engine(Engine):
             tmp = Path(str(path) + ".tmp")
             shutil.rmtree(tmp, ignore_errors=True)
             self.model_dir.mkdir(parents=True, exist_ok=True)
-            TransformersConverter(model_id).convert(str(tmp), quantization="int8", force=True)
+            # low_cpu_mem_usage: constructor argument in ctranslate2 4.6.3 (read in its source)
+            TransformersConverter(model_id, low_cpu_mem_usage=True).convert(str(tmp), quantization="int8", force=True)
             AutoTokenizer.from_pretrained(model_id).save_pretrained(str(tmp))
             shutil.rmtree(path, ignore_errors=True)
             tmp.rename(path)
@@ -330,7 +359,13 @@ class M2MEngine(CT2Engine):
         return [self._decode(tok, r.hypotheses[0][1:]) for r in res]
 
 
-ENGINES = {"opus": OpusEngine, "m2m100": M2MEngine}
+class M2MBigEngine(M2MEngine):
+    """facebook/m2m100_1.2B (MIT): same code path as m2m100, larger model."""
+    name = "m2m100-big"
+    MODEL = "facebook/m2m100_1.2B"
+
+
+ENGINES = {"opus": OpusEngine, "m2m100": M2MEngine, "m2m100-big": M2MBigEngine}
 
 
 class Translator:
@@ -346,37 +381,78 @@ class Translator:
             raw.update(zip(chunk, outs))
         return raw
 
-    def _run(self, pieces, src, tgt):
-        done, redo = {}, []
-        for s, o in self._batches(pieces, src, tgt).items():
-            if o and ph_ids(o) == ph_ids(s):
-                done[s] = o
-            elif PH_RE.search(s):
-                redo.append(s)  # model lost a placeholder: translate around the placeholders
+    def _checked(self, texts, src, tgt, items):
+        """-> {text: output or None}. An output is accepted only if every placeholder came back
+        and the digit runs equal the source's (digits then written 0-9). A digit mismatch is
+        redone once with the numbers protected as placeholders (STATS["num_retry"])."""
+        res, retry = {}, {}
+        for t, o in self._batches(texts, src, tgt).items():
+            if not o or ph_ids(o) != ph_ids(t):
+                res[t] = None
+            elif not digit_runs(t) or digit_runs(o) == digit_runs(t):
+                res[t] = o.translate(DIGIT_MAP)
+            else:
+                retry[t] = protect_numbers(t, items)
+        if retry:
+            STATS["num_retry"] += len(retry)
+            outs = self._batches(sorted(set(retry.values()), key=len), src, tgt)
+            for t, t2 in retry.items():
+                o = outs[t2]
+                res[t] = o if o and ph_ids(o) == ph_ids(t2) else None
+        return res
+
+    @staticmethod
+    def _droppable(s, items):
+        """True when every placeholder of the piece is an inline formatting tag and none is a link."""
+        ids = [int("".join(str(LETTERS.index(c.upper())) for c in m.group(1))) for m in PH_RE.finditer(s)]
+        return bool(ids) and all(
+            i < len(items) and INLINE_RE.fullmatch(items[i]) and not re.match(r"</?a[\s>/]", items[i], re.I)
+            and not items[i].lower().startswith(("<yk-keep", "</yk-keep"))
+            for i in ids)
+
+    def _run(self, pieces, src, tgt, items):
+        res = self._checked(pieces, src, tgt, items)
+        done = {s: o for s, o in res.items() if o is not None}
+        fail = [s for s in pieces if s not in done]
+        if fail:  # formatting-only placeholders: retry once without those tags
+            drop = {s: re.sub(r" {2,}", " ", PH_RE.sub("", s)).strip()
+                    for s in fail if self._droppable(s, items)}
+            if drop:
+                r3 = self._checked(sorted(set(drop.values()), key=len), src, tgt, items)
+                for s, t in drop.items():
+                    if r3[t] is not None:
+                        done[s] = r3[t]
+                        STATS["fmt_dropped"] += 1
+                fail = [s for s in fail if s not in done]
+        plan = {}
+        for s in fail:  # split at placeholders (numbers too, when only they were the problem)
+            if PH_RE.search(s):
+                plan[s] = split_at_ph(s)
+            elif digit_runs(s):
+                plan[s] = split_at_ph(protect_numbers(s, items))
             else:
                 STATS["kept"] += 1
                 log(f"empty output, piece kept untranslated: {s[:60]!r}")
                 done[s] = s
-        if redo:
-            plan = {s: split_at_ph(s) for s in redo}
+        if plan:
             segs = sorted({t.strip() for parts in plan.values() for k, t in parts
                            if k == "t" and LETTER_RE.search(t)}, key=len)
-            seg_out = self._batches(segs, src, tgt)
+            seg_out = self._checked(segs, src, tgt, items)
             for s, parts in plan.items():
                 STATS["split"] += 1
-                out = []
+                out = ""
                 for k, t in parts:
                     seg = t.strip()
                     if k == "t" and seg in seg_out:
                         o = seg_out[seg]
-                        if not o or PH_RE.search(o):
+                        if o is None:
                             STATS["kept"] += 1
-                            log(f"empty segment output, kept untranslated: {seg[:60]!r}")
+                            log(f"segment output unusable, kept untranslated: {seg[:60]!r}")
                             o = seg
-                        out.append(o)
+                        out += (" " if t[:1].isspace() else "") + o + (" " if t[-1:].isspace() else "")
                     else:
-                        out.append(t)
-                done[s] = join_parts(out)
+                        out += t
+                done[s] = out.strip()
         return done
 
     def field(self, text, src, tgt):
@@ -389,7 +465,7 @@ class Translator:
         parsed = parse(prot)
         todo = sorted({p for it in parsed if isinstance(it, tuple) for p in it[1] if needs_model(p)},
                       key=len)
-        done = self._run(todo, src, tgt)
+        done = self._run(todo, src, tgt, items)
         out = []
         for it in parsed:
             if isinstance(it, str):
@@ -468,6 +544,9 @@ SAMPLES = [
     ("Wedding hall in Sharq with capacity for 400 guests. Contact us for packages and availability.",
      "en", "ar"),
     ("Pay securely with KNET at checkout. Orders ship within 2 business days.", "en", "ar"),
+    ("Open daily from 9 am to 5 pm, and Fridays from 2:30 p.m. to 10 pm.", "en", "ar"),
+    ("Monthly rent is 350 KD, plus a service charge of 25 KWD.", "en", "ar"),
+    ("Our <strong>handmade</strong> sweets are baked fresh every day.", "en", "ar"),
     # Arabic -> English
     ("محل لبيع الأجهزة الكهربائية في حولي، أسعار منافسة وضمان سنة على جميع المنتجات.", "ar", "en"),
     ("للبيع سيارة نيسان باترول موديل 2016، ماشية 120 ألف كم، نظيفة وصبغ وكالة، السعر 6,200 دينار "
@@ -491,13 +570,14 @@ SAMPLES = [
      "ar", "en"),
     ("بيت للبيع في مبارك الكبير، مساحة 400 متر، خمس غرف نوم وملحق، قريب من الخدمات والمدارس.",
      "ar", "en"),
+    ("سيارة تويوتا كامري موديل 2019، ماشية 65,000 كم، السعر 4,800 دينار كويتي.", "ar", "en"),
 ]
 
 
 def selftest(tr):
     for text, s, t in (("Hello", "en", "ar"), ("مرحبا", "ar", "en")):  # warm-up, not counted
         tr.field(text, s, t)
-    for k in ("chars", "model_s", "kept", "split"):
+    for k in ("chars", "model_s", "kept", "split", "num_retry", "fmt_dropped"):
         STATS[k] = type(STATS[k])()
     for text, s, t in SAMPLES:
         out = tr.field(text, s, t)
@@ -508,7 +588,8 @@ def summary(wall):
     cps = STATS["chars"] / STATS["model_s"] if STATS["model_s"] else 0.0
     log("---- summary ----")
     log(f"jobs done: {STATS['done']}  jobs failed: {STATS['failed']}  "
-        f"pieces split at placeholders: {STATS['split']}  segments kept untranslated: {STATS['kept']}")
+        f"pieces split at placeholders: {STATS['split']}  segments kept untranslated: {STATS['kept']}  "
+        f"num_retry: {STATS['num_retry']}  fmt_dropped: {STATS['fmt_dropped']}")
     log(f"characters translated: {STATS['chars']}  seconds loading model: {STATS['load_s']:.1f}  "
         f"seconds in translate_batch: {STATS['model_s']:.1f}  chars/sec: {cps:.1f}  wall seconds: {wall:.1f}")
 

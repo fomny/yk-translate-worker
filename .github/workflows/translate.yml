@@ -8,7 +8,7 @@ on:
       engine:
         description: Translation engine
         type: choice
-        options: [opus, m2m100]
+        options: [opus, m2m100, m2m100-big]
         default: opus
       limit:
         description: Jobs fetched per round

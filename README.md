@@ -10,19 +10,26 @@ Set these in the GitHub repository (Settings > Secrets and variables > Actions) 
 |---|---|
 | `YK_SITE_URL` | Site address, for example `https://example.com` (secret) |
 | `YK_WORKER_TOKEN` | The shared secret sent as `X-YK-Token` (secret) |
-| `YK_ENGINE` | Optional: `opus` (default) or `m2m100`. In Actions it comes from the run input |
+| `YK_ENGINE` | Optional: `opus` (default), `m2m100` or `m2m100-big`. In Actions it comes from the run input |
 
 Optional tuning (PC or workflow env): `YK_MODEL_DIR` (default `./models`), `YK_BATCH` (16), `YK_LIMIT` (25), `YK_MAX_MINUTES` (20), `YK_GLOSSARY` (path of the glossary file, default `glossary.json` next to the script).
 
 ## Protected items and the glossary
 
-URLs, e-mails, phone numbers, numbers, HTML tags and comments (including Gutenberg `<!-- wp:... -->` blocks), WordPress shortcodes (`[name ...]`, `[/name]`) and `%variables%` such as `%title%` are replaced by placeholders before translation and put back byte-identical. If the model drops a placeholder, that piece is split at each placeholder, the text segments between them are translated separately in one batch, and everything is joined back in the original order.
+URLs, e-mails, phone-like numbers (7 or more digits), HTML tags and comments (including Gutenberg `<!-- wp:... -->` blocks), WordPress shortcodes (`[name ...]`, `[/name]`) and `%variables%` such as `%title%` are replaced by placeholders before translation and put back byte-identical. If the model drops a placeholder, the worker tries in this order:
+
+1. Pieces whose only placeholders are inline formatting tags (strong, b, em, i, u, span): translate once more without those tags (`fmt_dropped`). Links (`<a>`), block tags and `<yk-keep>` are never dropped.
+2. Otherwise split the piece at each placeholder, translate the text segments between them in one batch, and join them back in the original order (`split`).
+
+Plain numbers (prices, years, areas, times like 11:00, 20%) are not protected up front: the model sees them, and the output is accepted only if its digit runs equal the source's (Arabic-Indic digits are written as 0-9). If not, that piece is redone with its numbers as placeholders (`num_retry`). English to Arabic, a time with am/pm becomes a protected item: `11:00 am` becomes `11:00 صباحاً`, `1 pm` becomes `1 مساءً`, `12 pm` becomes `12 ظهراً`, `12 am` becomes `12 منتصف الليل`.
+
+Engines: `opus`, `m2m100` (418M) and `m2m100-big` (`facebook/m2m100_1.2B`, MIT). The 1.2B model needs more memory and time to convert on first use; its cache key is separate from the other engines.
 
 `glossary.json` fixes place names and fixed terms (Salmiya = السالمية, KNET = كي نت). It is a list of `{"en": [...], "ar": [...], "ar_ambiguous": false}`. The first item of each list is the form written out; the others are accepted spellings. A match is replaced by a protected item holding the other language's first form, so it follows the same mechanism as a URL. English matches are case-insensitive whole words, longest first; Arabic matches are whole words and accept one attached prefix (ب ل و ف ك, and لل for ل + ال). `"ar_ambiguous": true` marks an Arabic form that is also an ordinary word or name (شرق, بيان); it is applied English to Arabic only. A missing or invalid file logs one line and the worker continues without a glossary.
 
 ## Selftest from the Actions tab
 
-Actions > translate > Run workflow > tick `selftest`, pick the engine, run. It needs no site and no secrets. It runs one uncounted warm-up per direction, then 26 realistic samples (13 English to Arabic, 13 Arabic to English) and prints each as `[en->ar] source` and `=> output`. The summary shows: jobs done and failed, pieces split at placeholders, segments kept untranslated, characters translated, seconds loading the model (download, conversion, load), seconds inside `translate_batch`, and chars/sec (characters divided by the `translate_batch` time only, so it is the real translation speed). The first run downloads and converts the model (a few minutes); later runs reuse the cache.
+Actions > translate > Run workflow > tick `selftest`, pick the engine, run. It needs no site and no secrets. It runs one uncounted warm-up per direction, then 30 realistic samples (16 English to Arabic, 14 Arabic to English) and prints each as `[en->ar] source` and `=> output`. The summary shows: jobs done and failed, pieces split at placeholders, segments kept untranslated, `num_retry`, `fmt_dropped`, characters translated, seconds loading the model (download, conversion, load), seconds inside `translate_batch`, and chars/sec (characters divided by the `translate_batch` time only, so it is the real translation speed). The first run downloads and converts the model (a few minutes); later runs reuse the cache.
 
 ## Tests without a model
 
