@@ -3,7 +3,7 @@
 
 Pulls pending jobs over HTTPS, translates Arabic <-> English with an open
 model on CPU (CTranslate2), posts the results back. No vendor API, no cap.
-Env: YK_SITE_URL, YK_WORKER_TOKEN, YK_ENGINE (opus|m2m100|m2m100-big|madlad|tgemma), YK_OLLAMA_URL, YK_MODEL_DIR,
+Env: YK_SITE_URL, YK_WORKER_TOKEN, YK_ENGINE (tgemma (default)|opus|m2m100|m2m100-big|madlad), YK_OLLAMA_URL, YK_MODEL_DIR,
 YK_BATCH, YK_LIMIT, YK_MAX_MINUTES, YK_GLOSSARY (path of glossary.json).
 Flags: --selftest, --engine, --limit.
 """
@@ -14,6 +14,7 @@ import re
 import shutil
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 import requests
@@ -44,7 +45,8 @@ SENT_RE = re.compile(r"(\s*)([^.!?؟؛]*[.!?؟؛]+|[^.!?؟؛]+)(\s*)")
 SENT_CAP = 400
 
 STATS = {"done": 0, "failed": 0, "chars": 0, "model_s": 0.0, "load_s": 0.0, "kept": 0, "split": 0,
-         "num_retry": 0, "fmt_dropped": 0, "script_retry": 0, "len_reject": 0}
+         "num_retry": 0, "fmt_dropped": 0, "script_retry": 0, "len_reject": 0,
+         "natural_ok": 0, "protected_retry": 0}
 GLOSS = {}  # source language -> (compiled regex, lookup); filled by load_glossary()
 
 
@@ -73,12 +75,37 @@ def protect(text):
     return PROTECT_RE.sub(sub, text), items
 
 
-def restore(text, items):
-    def sub(m):
-        i = int("".join(str(LETTERS.index(c.upper())) for c in m.group(1)))
-        return items[i] if i < len(items) else m.group(0)
+def _edge(v, last):
+    """First (or last) character of v that is not a combining mark (tanwin, shadda ...)."""
+    for c in (reversed(v) if last else v):
+        if not unicodedata.category(c).startswith("M"):
+            return c
+    return ""
 
-    return PH_RE.sub(sub, text)
+
+def restore(text, items):
+    """Put the items back. A word-like item (glossary form, time phrase) gets a space on a side where
+    it would touch a letter or digit of the surrounding text; structural items never do."""
+    ms = list(PH_RE.finditer(text))
+    out, pos = [], 0
+    for k, m in enumerate(ms):
+        i = int("".join(str(LETTERS.index(c.upper())) for c in m.group(1)))
+        out.append(text[pos:m.start()])
+        pos = m.end()
+        if i >= len(items):
+            out.append(m.group(0))
+            continue
+        v = items[i]
+        word = bool(v) and not PROTECT_RE.fullmatch(v) and (_edge(v, False).isalnum() or _edge(v, True).isalnum())
+        if word and _edge(v, False).isalnum() and m.start() > 0 and text[m.start() - 1].isalnum() \
+                and not (k > 0 and ms[k - 1].end() == m.start()):
+            out.append(" ")
+        out.append(v)
+        if word and _edge(v, True).isalnum() and m.end() < len(text) and text[m.end()].isalnum() \
+                and not (k + 1 < len(ms) and ms[k + 1].start() == m.end()):
+            out.append(" ")
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def digit_runs(s):
@@ -244,24 +271,34 @@ def load_glossary(path):
         log(f"glossary not loaded ({type(e).__name__}); continuing without one")
         return 0
     en_map, ar_map, ll_map, n = {}, {}, {}, 0
+    entries, en_idx, ar_idx, ll_idx = [], {}, {}, {}
     for e in data:
         try:
             en = [str(x) for x in e["en"] if str(x).strip()]
             ar = [str(x) for x in e["ar"] if str(x).strip()]
             amb = bool(e.get("ar_ambiguous", False))
-        except (TypeError, KeyError):
+            en_ok = [str(x) for x in e.get("en_ok", []) if str(x).strip()]
+            ar_ok = [str(x) for x in e.get("ar_ok", []) if str(x).strip()]
+        except (TypeError, KeyError, AttributeError):
             continue
         if not en or not ar:
             continue
         n += 1
+        k = len(entries)
+        entries.append({"en": en + en_ok, "ar": ar + ar_ok})  # forms accepted in an output
         for v in en:
             en_map.setdefault(_norm_en(v), _norm_ar(ar[0]))
+            en_idx.setdefault(_norm_en(v), k)
         if not amb:  # an ordinary Arabic word is only replaced English -> Arabic
             for v in ar:
                 for w in _ar_variants(v):
                     ar_map.setdefault(w, en[0])
+                    ar_idx.setdefault(w, k)
                     if w.startswith("ال") and len(w) > 3:
                         ll_map.setdefault(w[2:], en[0])  # للسالمية = ل + ال + سالمية
+                        ll_idx.setdefault(w[2:], k)
+    GLOSS["entries"] = entries
+    GLOSS["idx"] = {"en": en_idx, "ar": (ar_idx, ll_idx)}
     if en_map:
         alt = "|".join(sorted((r"[\s\-]+".join(re.escape(w) for w in k.split(" ")) for k in en_map),
                               key=len, reverse=True))
@@ -309,6 +346,50 @@ def apply_glossary(prot, items, src, tgt):
     return rx.sub(sub, prot)
 
 
+def _ar_fold(s):
+    return re.sub(r"ة(?!\w)", "ه", s.translate(AR_FOLD))
+
+
+def glossary_hits(s, src, tgt):
+    """Indexes of the glossary entries that apply to piece s (same matching rules as apply_glossary)."""
+    g = GLOSS.get(src)
+    if not g or {src, tgt} != {"en", "ar"}:
+        return []
+    rx = g[0]
+    idx = GLOSS["idx"][src]
+    out = []
+    for m in rx.finditer(s):
+        if src == "en":
+            k = idx[_norm_en(m.group(0))]
+        elif m.groupdict().get("ll"):
+            k = idx[1][_norm_ar(m.group("rest"))]
+        else:
+            k = idx[0][_norm_ar(m.group("form"))]
+        out.append(k)
+    return out
+
+
+def _form_in(out, form, tgt):
+    if tgt == "ar":
+        core = _ar_fold(_norm_ar(form))
+        if core.startswith("ال") and len(core) > 3:
+            core = core[2:]
+        pat = r"(?<!\w)(?:[بلوفك]?(?:ال)?|لل)" + r"\s+".join(re.escape(w) for w in core.split()) + r"(?!\w)"
+        return re.search(pat, _ar_fold(out)) is not None
+    pat = r"(?<![a-z0-9])" + r"\s+".join(re.escape(w) for w in _norm_en(form).split()) + r"(?![a-z0-9])"
+    return re.search(pat, _norm_en(out)) is not None
+
+
+def gloss_ok(s, o, src, tgt):
+    """True when the output holds an accepted target form of every glossary entry found in the source."""
+    entries = GLOSS.get("entries", [])
+    for k in glossary_hits(s, src, tgt):
+        forms = entries[k]["ar" if tgt == "ar" else "en"]
+        if not any(_form_in(o, f, tgt) for f in forms):
+            return False
+    return True
+
+
 # ---------------------------------------------------------------- engines
 class Engine:
     """Interface: translate(texts, src, tgt) -> list of translated strings."""
@@ -318,6 +399,7 @@ class Engine:
     script_check = True         # output must be mostly in the target script
     len_check = False           # reject outputs far longer or shorter than the source
     sentence_retry = False      # on a failed check, retry the piece sentence by sentence
+    natural_first = False       # True: first try the natural sentence (structure protected only)
 
     def start(self):
         """Called once before the first job; raise RuntimeError when the engine is unusable."""
@@ -469,6 +551,7 @@ class TGemmaEngine(Engine):
     split_sentences = False
     len_check = True
     sentence_retry = True
+    natural_first = True
     LANGS = {"en": ("English", "en"), "ar": ("Arabic", "ar")}
     # Wording and layout from https://ollama.com/library/translategemma (two blank lines before the text).
     PROMPT = ("You are a professional {S} ({sc}) to {T} ({tc}) translator. Your goal is to accurately "
@@ -512,17 +595,18 @@ ENGINES = {"opus": OpusEngine, "m2m100": M2MEngine, "m2m100-big": M2MBigEngine,
 class Translator:
     def __init__(self, engine, batch):
         self.engine, self.batch = engine, max(1, batch)
+        self._memo = {}  # (src, tgt, text) -> output, for one field only: a repeat costs no model call
 
     def _batches(self, pieces, src, tgt):
-        raw = {}
-        for i in range(0, len(pieces), self.batch):
-            chunk = pieces[i:i + self.batch]
+        todo = [p for p in dict.fromkeys(pieces) if (src, tgt, p) not in self._memo]
+        for i in range(0, len(todo), self.batch):
+            chunk = todo[i:i + self.batch]
             outs = self.engine.translate(chunk, src, tgt)
             STATS["chars"] += sum(len(c) for c in chunk)
-            raw.update(zip(chunk, outs))
-        return raw
+            self._memo.update(((src, tgt, c), o) for c, o in zip(chunk, outs))
+        return {p: self._memo[(src, tgt, p)] for p in pieces}
 
-    def _checked(self, texts, src, tgt, items):
+    def _checked(self, texts, src, tgt, items, strict=False):
         """-> {text: output or None}. An output is accepted only if every placeholder came back
         and the digit runs equal the source's (digits then written 0-9). A digit mismatch is
         redone once with the numbers protected as placeholders (STATS["num_retry"])."""
@@ -550,7 +634,9 @@ class Translator:
             STATS["kept"] += 1
             log(f"output failed the script/length check, kept untranslated: {t[:60]!r}")
         for t, o in cand.items():
-            if not digit_runs(t) or digit_runs(o) == digit_runs(t):
+            if strict:  # split-fallback segment: digits must match exactly, no retry
+                res[t] = o.translate(DIGIT_MAP) if digit_runs(o) == digit_runs(t) else None
+            elif not digit_runs(t) or digit_runs(o) == digit_runs(t):
                 res[t] = o.translate(DIGIT_MAP)
             else:
                 retry[t] = protect_numbers(t, items)
@@ -597,7 +683,31 @@ class Translator:
             and not items[i].lower().startswith(("<yk-keep", "</yk-keep"))
             for i in ids)
 
+    def _natural_ok(self, s, o, src, tgt):
+        return bool(o) and ph_ids(o) == ph_ids(s) and not self._insane(s, o, tgt, count=False) \
+            and (not digit_runs(s) or digit_runs(o) == digit_runs(s)) and gloss_ok(s, o, src, tgt)
+
     def _run(self, pieces, src, tgt, items):
+        """natural_first engines: translate the natural piece (only structure protected) and verify it;
+        pieces that fail are redone with glossary/time items by the protected method."""
+        if not self.engine.natural_first:
+            return self._run_protected(pieces, src, tgt, items)
+        done, redo = {}, {}
+        for s, o in self._batches(pieces, src, tgt).items():
+            if self._natural_ok(s, o, src, tgt):
+                done[s] = o.translate(DIGIT_MAP)
+                STATS["natural_ok"] += 1
+            else:
+                redo[s] = apply_glossary(s, items, src, tgt)
+        if redo:
+            STATS["protected_retry"] += len(redo)
+            res = self._run_protected(sorted({v for v in redo.values() if needs_model(v)}, key=len),
+                                      src, tgt, items)
+            for s, v in redo.items():
+                done[s] = res.get(v, v)
+        return done
+
+    def _run_protected(self, pieces, src, tgt, items):
         res = self._checked(pieces, src, tgt, items)
         done = {s: o for s, o in res.items() if o is not None}
         fail = [s for s in pieces if s not in done]
@@ -624,7 +734,7 @@ class Translator:
         if plan:
             segs = sorted({t.strip() for parts in plan.values() for k, t in parts
                            if k == "t" and LETTER_RE.search(t)}, key=len)
-            seg_out = self._checked(segs, src, tgt, items)
+            seg_out = self._checked(segs, src, tgt, items, strict=True)
             for s, parts in plan.items():
                 STATS["split"] += 1
                 out = ""
@@ -648,7 +758,9 @@ class Translator:
         prot, items = protect(text)
         if script_matches(prot, tgt):
             return text
-        prot = apply_glossary(prot, items, src, tgt)
+        self._memo.clear()
+        if not self.engine.natural_first:  # natural-first engines see the plain sentence first
+            prot = apply_glossary(prot, items, src, tgt)
         parsed = parse(prot, self.engine.piece_cap, self.engine.split_sentences)
         todo = sorted({p for it in parsed if isinstance(it, tuple) for p in it[1] if needs_model(p)},
                       key=len)
@@ -764,7 +876,8 @@ SAMPLES = [
 def selftest(tr):
     for text, s, t in (("Hello", "en", "ar"), ("مرحبا", "ar", "en")):  # warm-up, not counted
         tr.field(text, s, t)
-    for k in ("chars", "model_s", "kept", "split", "num_retry", "fmt_dropped", "script_retry", "len_reject"):
+    for k in ("chars", "model_s", "kept", "split", "num_retry", "fmt_dropped", "script_retry", "len_reject",
+              "natural_ok", "protected_retry"):
         STATS[k] = type(STATS[k])()
     for text, s, t in SAMPLES:
         out = tr.field(text, s, t)
@@ -777,7 +890,8 @@ def summary(wall):
     log(f"jobs done: {STATS['done']}  jobs failed: {STATS['failed']}  "
         f"pieces split at placeholders: {STATS['split']}  segments kept untranslated: {STATS['kept']}  "
         f"num_retry: {STATS['num_retry']}  fmt_dropped: {STATS['fmt_dropped']}  "
-        f"script_retry: {STATS['script_retry']}  len_reject: {STATS['len_reject']}")
+        f"script_retry: {STATS['script_retry']}  len_reject: {STATS['len_reject']}  "
+        f"natural_ok: {STATS['natural_ok']}  protected_retry: {STATS['protected_retry']}")
     log(f"characters translated: {STATS['chars']}  seconds loading model: {STATS['load_s']:.1f}  "
         f"seconds in translate_batch: {STATS['model_s']:.1f}  chars/sec: {cps:.1f}  wall seconds: {wall:.1f}")
 
@@ -785,7 +899,7 @@ def summary(wall):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--selftest", action="store_true", help="translate the built-in samples, no site needed")
-    ap.add_argument("--engine", default=os.environ.get("YK_ENGINE", "opus"), choices=sorted(ENGINES))
+    ap.add_argument("--engine", default=os.environ.get("YK_ENGINE", "tgemma"), choices=sorted(ENGINES))
     ap.add_argument("--limit", type=int, default=int(os.environ.get("YK_LIMIT", "25") or 25))
     args = ap.parse_args()
 

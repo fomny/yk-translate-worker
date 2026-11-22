@@ -308,7 +308,7 @@ class ScriptEngine(tw.Engine):
 
 def with_engine(eng):
     for k in ("chars", "model_s", "load_s", "kept", "split", "num_retry", "fmt_dropped",
-              "script_retry", "len_reject"):
+              "script_retry", "len_reject", "natural_ok", "protected_retry"):
         tw.STATS[k] = type(tw.STATS[k])()
     return tw.Translator(eng, 16)
 
@@ -379,4 +379,91 @@ except RuntimeError as e:
     assert "Ollama is not running at http://127.0.0.1:9" in str(e)
 assert set(tw.ENGINES) == {"opus", "m2m100", "m2m100-big", "madlad", "tgemma"}
 print("ok 23 engines")
+
+# ---- 24. spacing when restoring word-like items; structural items never get spaces
+assert tw.restore("120 QXAXQفقط", ["دينار كويتي"]) == "120 دينار كويتي فقط"
+assert tw.restore("QXAXQو أيام", ["5 مساءً"]) == "5 مساءً و أيام"
+assert tw.restore("inQXAXQ.", ["Salmiya"]) == "in Salmiya."
+assert tw.restore("atQXAXQ", ["11:00 صباحاً"]) == "at 11:00 صباحاً"
+assert tw.restore("wordQXAXQnext", ["<br>"]) == "word<br>next"
+assert tw.restore("wordQXAXQnext", ["https://x.com/a"]) == "wordhttps://x.com/anext"
+assert tw.restore("aQXAXQQXBXQb", ["السالمية", '<yk-keep n="1">']) == 'a السالمية<yk-keep n="1">b'
+assert tw.restore("QXAXQ QXBXQ", ["السالمية", "<b>"]) == "السالمية <b>"
+print("ok 24 restore spacing")
+
+
+class NatEngine(tw.Engine):
+    """Natural-first fake: answers by exact input text (placeholders as the code builds them)."""
+    name = "nat"
+    natural_first = True
+    piece_cap, split_sentences = 1200, False
+
+    def __init__(self, answers):
+        self.answers, self.calls = answers, []
+
+    def translate(self, texts, src, tgt):
+        self.calls.append(list(texts))
+        return [self.answers.get(t, "؟؟") for t in texts]
+
+
+tw.load_glossary(os.path.join(HERE, "glossary.json"))
+
+# ---- 25. natural first: accepted without placeholders
+tr = with_engine(NatEngine({"Rent 450 KWD per month.": "الإيجار 450 دينار كويتي شهريا.",
+                            "Open 9 am to 5 pm.": "مفتوح من 9 صباحاً إلى 5 مساءً.",
+                            "Wedding hall in Sharq.": "قاعة زفاف في الشرق."}))
+assert tr.field("Rent 450 KWD per month.", "en", "ar") == "الإيجار 450 دينار كويتي شهريا."
+assert tr.field("Open 9 am to 5 pm.", "en", "ar") == "مفتوح من 9 صباحاً إلى 5 مساءً."
+assert tr.field("Wedding hall in Sharq.", "en", "ar") == "قاعة زفاف في الشرق."
+assert tw.STATS["natural_ok"] == 3 and tw.STATS["protected_retry"] == 0, tw.STATS
+assert all("QX" not in t for c in tr.engine.calls for t in c) and tr.engine.calls[0] == ["Rent 450 KWD per month."]
+print("ok 25 natural first accepted")
+
+# ---- 26. glossary form missing -> redone with the protected method
+tr = with_engine(NatEngine({"Rent 450 KWD per month.": "الإيجار 450 دولار شهريا.",
+                            "Rent 450 QXAXQ per month.": "الإيجار 450 QXAXQ شهريا."}))
+assert tr.field("Rent 450 KWD per month.", "en", "ar") == "الإيجار 450 دينار كويتي شهريا."
+assert tw.STATS["natural_ok"] == 0 and tw.STATS["protected_retry"] == 1, tw.STATS
+tr = with_engine(NatEngine({"Wedding hall in Sharq.": "قاعة زفاف في الشمال.",
+                            "Wedding hall in QXAXQ.": "قاعة زفاف في QXAXQ."}))
+assert tr.field("Wedding hall in Sharq.", "en", "ar") == "قاعة زفاف في شرق."
+tr = with_engine(NatEngine({"شقة في السالمية": "Apartment in Salmia",
+                            "شقة في QXAXQ": "Apartment in QXAXQ"}))
+assert tr.field("شقة في السالمية", "ar", "en") == "Apartment in Salmiya"  # prefix word kept as its own word
+assert tw.STATS["protected_retry"] == 1
+tr = with_engine(NatEngine({"شقة في السالمية": "Apartment in Salmiya"}))
+assert tr.field("شقة في السالمية", "ar", "en") == "Apartment in Salmiya" and tw.STATS["natural_ok"] == 1
+print("ok 26 protected retry on glossary miss")
+
+# ---- 27. digit mismatch -> protected method, numbers as placeholders when needed
+tr = with_engine(NatEngine({"Rent 450 per month.": "الإيجار 45 شهريا.",
+                            "Rent QXAXQ per month.": "الإيجار QXAXQ شهريا."}))
+out = tr.field("Rent 450 per month.", "en", "ar")
+assert out == "الإيجار 450 شهريا." and tw.STATS["protected_retry"] == 1 and tw.STATS["num_retry"] == 1, (out, tw.STATS)
+print("ok 27 digit mismatch")
+
+# ---- 28. structure still protected in the natural first attempt
+tr = with_engine(NatEngine({"Visit QXAXQ now.": "زوروا QXAXQ الآن."}))
+out = tr.field("Visit https://example.com now.", "en", "ar")
+assert out == "زوروا https://example.com الآن." and tw.STATS["natural_ok"] == 1, (out, tw.STATS)
+print("ok 28 structure protected")
+
+
+class InventEngine(KeepEngine):
+    """Drops placeholders in whole pieces; makes up digits for short segments."""
+
+    def translate(self, texts, src, tgt):
+        self.calls.append(list(texts))
+        return [tw.PH_RE.sub("", t).strip() if "QX" in t else "x 25" for t in texts]
+
+
+# ---- 29. split fallback: a segment with invented digits keeps its source
+tr, eng = fresh(InventEngine)
+out = tr.field("Call 5555 1234 today", "en", "ar")
+assert out == "Call 5555 1234 today" and tw.STATS["kept"] == 2 and tw.STATS["split"] == 1, (out, tw.STATS)
+print("ok 29 split segments keep digits strict")
+
+assert tw.TGemmaEngine.natural_first and not any(
+    getattr(tw.ENGINES[n], "natural_first", False) for n in ("opus", "m2m100", "m2m100-big", "madlad"))
+print("ok 30 natural_first only for tgemma")
 print("ALL TESTS PASSED")

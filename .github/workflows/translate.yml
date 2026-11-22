@@ -8,11 +8,14 @@ on:
       engine:
         description: Translation engine
         type: choice
-        options: [opus, m2m100, m2m100-big, madlad, tgemma]
-        default: opus
+        options: [tgemma, opus, m2m100, m2m100-big, madlad]
+        default: tgemma
       limit:
         description: Jobs fetched per round
         default: "25"
+      max_minutes:
+        description: Minutes the worker may run before it stops taking jobs (use a large value for one long backfill run)
+        default: "20"
       selftest:
         description: Run the built-in selftest (no site needed)
         type: boolean
@@ -30,9 +33,9 @@ permissions:
 jobs:
   translate:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 330
     env:
-      YK_ENGINE: ${{ github.event.inputs.engine || 'opus' }}
+      YK_ENGINE: ${{ github.event.inputs.engine || 'tgemma' }}
       YK_PURGE_HF_CACHE: "1"
       OLLAMA_MODELS: ${{ github.workspace }}/ollama-models
       YK_LIMIT: ${{ github.event.inputs.limit || '25' }}
@@ -63,11 +66,16 @@ jobs:
         if: steps.check.outputs.run == 'true'
 
       - uses: actions/setup-python@v5
-        if: steps.check.outputs.run == 'true'
+        if: steps.check.outputs.run == 'true' && env.YK_ENGINE != 'tgemma'
         with:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: requirements.txt
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.run == 'true' && env.YK_ENGINE == 'tgemma'
+        with:
+          python-version: "3.11"
 
       - uses: actions/cache@v4
         id: models
@@ -83,8 +91,12 @@ jobs:
           key: ollama-translategemma-4b-v1
 
       - name: Install requirements
-        if: steps.check.outputs.run == 'true'
+        if: steps.check.outputs.run == 'true' && env.YK_ENGINE != 'tgemma'
         run: pip install -r requirements.txt
+
+      - name: Install requests only (tgemma needs no model libraries)
+        if: steps.check.outputs.run == 'true' && env.YK_ENGINE == 'tgemma'
+        run: pip install requests==2.32.3
 
       # madlad: converting the 11.8 GB float32 model needs more than the 16 GB of RAM, so add swap
       # and keep the Hugging Face download on /mnt (the runner's / has only about 14 GB free).
@@ -134,5 +146,5 @@ jobs:
         env:
           YK_SITE_URL: ${{ secrets.YK_SITE_URL }}
           YK_WORKER_TOKEN: ${{ secrets.YK_WORKER_TOKEN }}
-          YK_MAX_MINUTES: "20"
+          YK_MAX_MINUTES: ${{ github.event.inputs.max_minutes || '20' }}
         run: python translate_worker.py
