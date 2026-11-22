@@ -8,7 +8,7 @@ on:
       engine:
         description: Translation engine
         type: choice
-        options: [opus, m2m100, m2m100-big]
+        options: [opus, m2m100, m2m100-big, madlad, tgemma]
         default: opus
       limit:
         description: Jobs fetched per round
@@ -30,9 +30,11 @@ permissions:
 jobs:
   translate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     env:
       YK_ENGINE: ${{ github.event.inputs.engine || 'opus' }}
+      YK_PURGE_HF_CACHE: "1"
+      OLLAMA_MODELS: ${{ github.workspace }}/ollama-models
       YK_LIMIT: ${{ github.event.inputs.limit || '25' }}
       YK_MODEL_DIR: ${{ github.workspace }}/models
       SELFTEST: ${{ github.event.inputs.selftest || 'false' }}
@@ -68,14 +70,60 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - uses: actions/cache@v4
-        if: steps.check.outputs.run == 'true'
+        id: models
+        if: steps.check.outputs.run == 'true' && env.YK_ENGINE != 'tgemma'
         with:
           path: models
           key: models-${{ env.YK_ENGINE }}-v1
 
+      - uses: actions/cache@v4
+        if: steps.check.outputs.run == 'true' && env.YK_ENGINE == 'tgemma'
+        with:
+          path: ollama-models
+          key: ollama-translategemma-4b-v1
+
       - name: Install requirements
         if: steps.check.outputs.run == 'true'
         run: pip install -r requirements.txt
+
+      # madlad: converting the 11.8 GB float32 model needs more than the 16 GB of RAM, so add swap
+      # and keep the Hugging Face download on /mnt (the runner's / has only about 14 GB free).
+      - name: Prepare memory and disk for the madlad conversion
+        if: steps.check.outputs.run == 'true' && env.YK_ENGINE == 'madlad' && steps.models.outputs.cache-hit != 'true'
+        run: |
+          df -h / /mnt
+          free -h
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo fallocate -l 16G /mnt/swapfile
+          sudo chmod 600 /mnt/swapfile
+          sudo mkswap /mnt/swapfile
+          sudo swapon /mnt/swapfile
+          sudo mkdir -p /mnt/hf
+          sudo chown "$(id -u):$(id -g)" /mnt/hf
+          echo "HF_HOME=/mnt/hf" >> "$GITHUB_ENV"
+          free -h
+          df -h / /mnt
+
+      - name: Install and start Ollama
+        if: steps.check.outputs.run == 'true' && env.YK_ENGINE == 'tgemma'
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          # the installer may start its own systemd service (models under /usr/share/ollama):
+          # stop it so that our server, started below with OLLAMA_MODELS, owns port 11434
+          sudo systemctl stop ollama 2>/dev/null || true
+          sudo systemctl disable ollama 2>/dev/null || true
+          mkdir -p "$OLLAMA_MODELS"
+          setsid nohup ollama serve > ollama.log 2>&1 < /dev/null &
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:11434/api/tags > /dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:11434/api/tags > /dev/null || { cat ollama.log; exit 1; }
+          ollama --version
+          ollama pull translategemma:4b
+          ollama list
+          df -h /
 
       - name: Selftest
         if: steps.check.outputs.run == 'true' && env.SELFTEST == 'true'

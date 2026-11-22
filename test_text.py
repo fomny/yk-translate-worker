@@ -26,6 +26,7 @@ except Exception:
 class KeepEngine(tw.Engine):
     """Tags every piece and keeps placeholders, like a well-behaved model."""
     name = "keep"
+    script_check = False  # these fakes tag text with Latin letters; the script check has its own tests
 
     def __init__(self):
         self.calls = []
@@ -282,4 +283,100 @@ print("ok 17 glossary additions")
 assert "m2m100-big" in tw.ENGINES and tw.ENGINES["m2m100-big"].MODEL == "facebook/m2m100_1.2B"
 assert tw.ENGINES["m2m100"].MODEL == "facebook/m2m100_418M"
 print("ok 18 engines")
+# ---- 19. paragraph pieces for LLM-style engines
+items = tw.parse("First sentence. Second sentence.\nThird.", 1200, False)
+assert items == [("", ["First sentence. Second sentence."], ""), "\n", ("", ["Third."], "")], items
+long_par = " ".join(f"Sentence number {i} is here." for i in range(12))
+items = tw.parse(long_par, 80, False)
+assert len(items) == 1 and len(items[0][1]) > 1 and all(len(p) <= 80 for p in items[0][1]), items
+assert " ".join(items[0][1]) == long_par
+assert len(tw.parse("One. Two. Three.", 400, True)) == 3  # default: one item per sentence
+print("ok 19 parse without sentence split")
+
+
+class ScriptEngine(tw.Engine):
+    """Returns whatever `answers` maps the input to (default: an untranslated copy)."""
+    name = "script"
+
+    def __init__(self, answers=None):
+        self.answers, self.calls = answers or {}, []
+
+    def translate(self, texts, src, tgt):
+        self.calls.append(list(texts))
+        return [self.answers.get(t, t) for t in texts]
+
+
+def with_engine(eng):
+    for k in ("chars", "model_s", "load_s", "kept", "split", "num_retry", "fmt_dropped",
+              "script_retry", "len_reject"):
+        tw.STATS[k] = type(tw.STATS[k])()
+    return tw.Translator(eng, 16)
+
+
+# ---- 20. target-script check, all engines
+tw.load_glossary(os.path.join(HERE, "no-such-file.json"))
+tr = with_engine(ScriptEngine({"Hello there friend": "Hello there buddy"}))
+assert tr.field("Hello there friend", "en", "ar") == "Hello there friend"  # still English: kept
+assert tw.STATS["script_retry"] == 1 and tw.STATS["kept"] == 1, tw.STATS
+tr = with_engine(ScriptEngine({"Visit the Nokia store": "زيارة متجر Nokia"}))  # brand from the source is fine
+assert tr.field("Visit the Nokia store", "en", "ar") == "زيارة متجر Nokia" and tw.STATS["script_retry"] == 0
+tr = with_engine(ScriptEngine({"محل في المدينة القديمة": "محل في المدينة القديمة"}))  # echo, ar->en
+assert tr.field("محل في المدينة القديمة", "ar", "en") == "محل في المدينة القديمة" and tw.STATS["kept"] == 1
+tr = with_engine(ScriptEngine({"محل في المدينة القديمة": "shop in the old city"}))  # real translation passes
+assert tr.field("محل في المدينة القديمة", "ar", "en") == "shop in the old city" and tw.STATS["kept"] == 0
+tr = with_engine(ScriptEngine({"Call me": "Call me"}))  # a short echo (could be a name) is not rejected
+assert tr.field("Call me", "en", "ar") == "Call me" and tw.STATS["script_retry"] == 0
+print("ok 20 script check")
+
+
+class LLMFake(ScriptEngine):
+    piece_cap, split_sentences, len_check, sentence_retry = 1200, False, True, True
+
+    def translate(self, texts, src, tgt):
+        self.calls.append(list(texts))
+        return [self.answers[t] if t in self.answers else
+                (t if len(tw.SENT_RE.findall(t)) > 1 else "ترجمة") for t in texts]
+
+
+# ---- 21. LLM engine: failed paragraph retried sentence by sentence, then kept
+two = "Hello there my friend. How are you today?"
+tr = with_engine(LLMFake())
+out = tr.field(two, "en", "ar")
+assert out == "ترجمة ترجمة" and tw.STATS["script_retry"] == 1 and tw.STATS["kept"] == 0, (out, tw.STATS)
+assert tr.engine.calls[0] == [two] and sorted(tr.engine.calls[1]) == ["Hello there my friend.", "How are you today?"]
+one = "A single short sentence that is long enough to matter here."
+tr = with_engine(LLMFake({one: "ن" * 500}))  # absurdly long answer
+assert tr.field(one, "en", "ar") == one and tw.STATS["len_reject"] == 1 and tw.STATS["kept"] == 1
+longer = "This sentence is over sixty characters long so that a tiny answer is suspicious."
+tr = with_engine(LLMFake({longer: "ن"}))
+assert tr.field(longer, "en", "ar") == longer and tw.STATS["len_reject"] == 1
+print("ok 21 llm retry and length check")
+
+# ---- 22. cleaning an LLM answer
+assert tw.clean_llm('  "Hello"  ', "x") == "Hello"
+assert tw.clean_llm('```\nمرحبا\n```', "x") == "مرحبا"
+assert tw.clean_llm("Here is the translation:\nمرحبا بك", "x") == "مرحبا بك"
+assert tw.clean_llm("Translation: مرحبا", "x") == "مرحبا"
+assert tw.clean_llm("The translation of the poem is long", "x") == "The translation of the poem is long"
+assert tw.clean_llm('"Quoted" source', '"Quoted" source') == '"Quoted" source'
+print("ok 22 clean_llm")
+
+# ---- 23. engine definitions: prompt, caps, fatal start, converter settings
+g = tw.TGemmaEngine()
+assert g.prompt("Hello, how are you?", "en", "ar") == (
+    "You are a professional English (en) to Arabic (ar) translator. Your goal is to accurately convey the "
+    "meaning and nuances of the original English text while adhering to Arabic grammar, vocabulary, and "
+    "cultural sensitivities.\nProduce only the Arabic translation, without any additional explanations or "
+    "commentary. Please translate the following English text into Arabic:\n\n\nHello, how are you?")
+assert (g.piece_cap, g.split_sentences, g.MODEL) == (1200, False, "translategemma:4b")
+assert (tw.MadladEngine.piece_cap, tw.MadladEngine.split_sentences) == (400, True)
+assert tw.MadladEngine.MODEL == "google/madlad400-3b-mt" and tw.MadladEngine.SAVE_SLOW_TOKENIZER
+os.environ["YK_OLLAMA_URL"] = "http://127.0.0.1:9"
+try:
+    tw.TGemmaEngine().start()
+    raise AssertionError("start() should fail when nothing listens")
+except RuntimeError as e:
+    assert "Ollama is not running at http://127.0.0.1:9" in str(e)
+assert set(tw.ENGINES) == {"opus", "m2m100", "m2m100-big", "madlad", "tgemma"}
+print("ok 23 engines")
 print("ALL TESTS PASSED")

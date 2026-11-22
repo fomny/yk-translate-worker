@@ -3,7 +3,7 @@
 
 Pulls pending jobs over HTTPS, translates Arabic <-> English with an open
 model on CPU (CTranslate2), posts the results back. No vendor API, no cap.
-Env: YK_SITE_URL, YK_WORKER_TOKEN, YK_ENGINE (opus|m2m100|m2m100-big), YK_MODEL_DIR,
+Env: YK_SITE_URL, YK_WORKER_TOKEN, YK_ENGINE (opus|m2m100|m2m100-big|madlad|tgemma), YK_OLLAMA_URL, YK_MODEL_DIR,
 YK_BATCH, YK_LIMIT, YK_MAX_MINUTES, YK_GLOSSARY (path of glossary.json).
 Flags: --selftest, --engine, --limit.
 """
@@ -44,7 +44,7 @@ SENT_RE = re.compile(r"(\s*)([^.!?؟؛]*[.!?؟؛]+|[^.!?؟؛]+)(\s*)")
 SENT_CAP = 400
 
 STATS = {"done": 0, "failed": 0, "chars": 0, "model_s": 0.0, "load_s": 0.0, "kept": 0, "split": 0,
-         "num_retry": 0, "fmt_dropped": 0}
+         "num_retry": 0, "fmt_dropped": 0, "script_retry": 0, "len_reject": 0}
 GLOSS = {}  # source language -> (compiled regex, lookup); filled by load_glossary()
 
 
@@ -139,8 +139,32 @@ def split_long(core, cap=SENT_CAP):
     return [p.strip() for p in final if p.strip()]
 
 
-def parse(text):
-    """-> list of str (literal) or (lead, [pieces], trail)."""
+def pack_sentences(core, cap):
+    """Greedy: whole sentences joined into pieces of at most cap characters."""
+    pieces, cur = [], ""
+    for m in SENT_RE.finditer(core):
+        s = m.group(2).strip()
+        if not s:
+            continue
+        if len(s) > cap:
+            if cur:
+                pieces.append(cur)
+                cur = ""
+            pieces.extend(split_long(s, cap))
+        elif cur and len(cur) + 1 + len(s) > cap:
+            pieces.append(cur)
+            cur = s
+        else:
+            cur = f"{cur} {s}" if cur else s
+    if cur:
+        pieces.append(cur)
+    return pieces
+
+
+def parse(text, cap=SENT_CAP, sentences=True):
+    """-> list of str (literal) or (lead, [pieces], trail).
+    sentences=True: one item per sentence. False: one item per paragraph (line), cut on
+    sentence ends only when it is longer than cap."""
     items = []
     for part in re.split(r"(\n+)", text):
         if not part:
@@ -148,12 +172,21 @@ def parse(text):
         if part.startswith("\n"):
             items.append(part)
             continue
+        if not sentences:
+            core = part.strip()
+            if not core:
+                items.append(part)
+            else:
+                lead = part[:len(part) - len(part.lstrip())]
+                trail = part[len(part.rstrip()):]
+                items.append((lead, [core] if len(core) <= cap else pack_sentences(core, cap), trail))
+            continue
         for m in SENT_RE.finditer(part):
             lead, core, trail = m.groups()
             if not core.strip():
                 items.append(m.group(0))
             else:
-                items.append((lead, split_long(core), trail))
+                items.append((lead, split_long(core, cap), trail))
     return items
 
 
@@ -280,13 +313,35 @@ def apply_glossary(prot, items, src, tgt):
 class Engine:
     """Interface: translate(texts, src, tgt) -> list of translated strings."""
     name = "base"
+    piece_cap = SENT_CAP        # longest piece sent in one call
+    split_sentences = True      # False: pieces are whole paragraphs (LLM-style engines)
+    script_check = True         # output must be mostly in the target script
+    len_check = False           # reject outputs far longer or shorter than the source
+    sentence_retry = False      # on a failed check, retry the piece sentence by sentence
+
+    def start(self):
+        """Called once before the first job; raise RuntimeError when the engine is unusable."""
 
     def translate(self, texts, src, tgt):
         raise NotImplementedError
 
 
+def sh_report(label, path):
+    """Log memory and disk (Linux `free -h`, `df -h`); silently nothing where they do not exist."""
+    import subprocess
+    for cmd in (["free", "-h"], ["df", "-h", str(path)]):
+        try:
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout.rstrip()
+        except Exception:
+            continue
+        log(f"{label}: {' '.join(cmd)}\n{out}")
+
+
 class CT2Engine(Engine):
     """Shared logic: convert a HF model to CTranslate2 int8 once, then load it."""
+
+    SAVE_SLOW_TOKENIZER = False   # True: save the slow tokenizer class (needs no protobuf)
+    REPORT_MEMORY = False         # True: log `free -h` and `df -h` around the conversion
 
     def __init__(self, model_dir):
         self.model_dir = Path(model_dir)
@@ -307,11 +362,19 @@ class CT2Engine(Engine):
             tmp = Path(str(path) + ".tmp")
             shutil.rmtree(tmp, ignore_errors=True)
             self.model_dir.mkdir(parents=True, exist_ok=True)
+            if self.REPORT_MEMORY:
+                sh_report("before conversion", self.model_dir)
             # low_cpu_mem_usage: constructor argument in ctranslate2 4.6.3 (read in its source)
             TransformersConverter(model_id, low_cpu_mem_usage=True).convert(str(tmp), quantization="int8", force=True)
-            AutoTokenizer.from_pretrained(model_id).save_pretrained(str(tmp))
+            saver = tok_cls if self.SAVE_SLOW_TOKENIZER else AutoTokenizer
+            saver.from_pretrained(model_id).save_pretrained(str(tmp))
             shutil.rmtree(path, ignore_errors=True)
             tmp.rename(path)
+            if os.environ.get("YK_PURGE_HF_CACHE") == "1":  # set by the workflow: keep the job cache small
+                shutil.rmtree(Path(os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface"),
+                              ignore_errors=True)
+            if self.REPORT_MEMORY:
+                sh_report("after conversion", self.model_dir)
         tok = tok_cls.from_pretrained(str(path))
         trans = ctranslate2.Translator(str(path), device="cpu", compute_type="int8",
                                        inter_threads=1, intra_threads=os.cpu_count() or 2)
@@ -365,7 +428,85 @@ class M2MBigEngine(M2MEngine):
     MODEL = "facebook/m2m100_1.2B"
 
 
-ENGINES = {"opus": OpusEngine, "m2m100": M2MEngine, "m2m100-big": M2MBigEngine}
+class MadladEngine(CT2Engine):
+    """google/madlad400-3b-mt (Apache-2.0, T5): target language chosen by a `<2xx> ` prefix."""
+    name = "madlad"
+    MODEL = "google/madlad400-3b-mt"
+    SAVE_SLOW_TOKENIZER = True
+    REPORT_MEMORY = True
+
+    def translate(self, texts, src, tgt):
+        trans, tok = self._load(self.MODEL, "T5Tokenizer")
+        batch = [tok.convert_ids_to_tokens(tok.encode(f"<2{tgt}> {t}", truncation=True, max_length=512))
+                 for t in texts]
+        res = self._timed(trans, batch, beam_size=2, max_decoding_length=300)
+        return [self._decode(tok, r.hypotheses[0]) for r in res]
+
+
+_PREAMBLE_RE = re.compile(r"^\s*(?:here(?: is|'s) the (?:arabic |english )?translation|"
+                          r"(?:arabic |english )?translation)\s*:\s*", re.I)
+
+
+def clean_llm(out, src):
+    """Strip whitespace, a code fence, wrapping quotes and a one-line preamble from a model answer."""
+    s = out.strip()
+    m = re.fullmatch(r"```[A-Za-z]*\n?(.*?)\n?```", s, re.S)
+    if m:
+        s = m.group(1).strip()
+    s = _PREAMBLE_RE.sub("", s, count=1).strip()
+    for a, b in (('"', '"'), ("“", "”"), ("«", "»"), ("'", "'")):
+        if len(s) > 1 and s[0] == a and s[-1] == b and a not in src and b not in src:
+            s = s[1:-1].strip()
+            break
+    return s
+
+
+class TGemmaEngine(Engine):
+    """TranslateGemma 4B (Gemma Terms of Use) served by a local Ollama; one request per piece."""
+    name = "tgemma"
+    MODEL = "translategemma:4b"
+    piece_cap = 1200
+    split_sentences = False
+    len_check = True
+    sentence_retry = True
+    LANGS = {"en": ("English", "en"), "ar": ("Arabic", "ar")}
+    # Wording and layout from https://ollama.com/library/translategemma (two blank lines before the text).
+    PROMPT = ("You are a professional {S} ({sc}) to {T} ({tc}) translator. Your goal is to accurately "
+              "convey the meaning and nuances of the original {S} text while adhering to {T} grammar, "
+              "vocabulary, and cultural sensitivities.\n"
+              "Produce only the {T} translation, without any additional explanations or commentary. "
+              "Please translate the following {S} text into {T}:\n\n\n{text}")
+
+    def __init__(self, model_dir=None):
+        self.url = (os.environ.get("YK_OLLAMA_URL") or "http://127.0.0.1:11434").rstrip("/")
+
+    def start(self):
+        try:
+            requests.get(self.url + "/api/tags", timeout=10).raise_for_status()
+        except Exception as e:
+            raise RuntimeError(f"Ollama is not running at {self.url} ({type(e).__name__})") from e
+
+    def prompt(self, text, src, tgt):
+        (S, sc), (T, tc) = self.LANGS[src], self.LANGS[tgt]
+        return self.PROMPT.format(S=S, sc=sc, T=T, tc=tc, text=text)
+
+    def translate(self, texts, src, tgt):
+        out = []
+        for t in texts:
+            body = {"model": self.MODEL, "stream": False, "keep_alive": "3h",
+                    "messages": [{"role": "user", "content": self.prompt(t, src, tgt)}],
+                    "options": {"temperature": 0, "seed": 42, "num_ctx": 2048,
+                                "num_predict": min(1024, max(64, 3 * (len(t) // 3 + 1)))}}
+            t0 = time.time()
+            r = requests.post(self.url + "/api/chat", json=body, timeout=180)
+            STATS["model_s"] += time.time() - t0
+            r.raise_for_status()
+            out.append(clean_llm(r.json().get("message", {}).get("content", ""), t))
+        return out
+
+
+ENGINES = {"opus": OpusEngine, "m2m100": M2MEngine, "m2m100-big": M2MBigEngine,
+           "madlad": MadladEngine, "tgemma": TGemmaEngine}
 
 
 class Translator:
@@ -385,11 +526,31 @@ class Translator:
         """-> {text: output or None}. An output is accepted only if every placeholder came back
         and the digit runs equal the source's (digits then written 0-9). A digit mismatch is
         redone once with the numbers protected as placeholders (STATS["num_retry"])."""
-        res, retry = {}, {}
+        res, retry, cand, bad = {}, {}, {}, []
         for t, o in self._batches(texts, src, tgt).items():
             if not o or ph_ids(o) != ph_ids(t):
                 res[t] = None
-            elif not digit_runs(t) or digit_runs(o) == digit_runs(t):
+            elif self._insane(t, o, tgt):
+                bad.append(t)
+                cand[t] = o
+            else:
+                cand[t] = o
+        eng = self.engine
+        redo = [t for t in bad if eng.sentence_retry and len(self._sentences(t)) > 1]
+        if redo:  # same instruction, one sentence per call
+            outs = self._batches(sorted({s for t in redo for s in self._sentences(t)}, key=len), src, tgt)
+            for t in redo:
+                o = " ".join(outs.get(s) or "" for s in self._sentences(t)).strip()
+                if o and ph_ids(o) == ph_ids(t) and not self._insane(t, o, tgt, count=False):
+                    cand[t] = o
+                    bad.remove(t)
+        for t in bad:  # still failing: keep the source piece
+            del cand[t]
+            res[t] = t
+            STATS["kept"] += 1
+            log(f"output failed the script/length check, kept untranslated: {t[:60]!r}")
+        for t, o in cand.items():
+            if not digit_runs(t) or digit_runs(o) == digit_runs(t):
                 res[t] = o.translate(DIGIT_MAP)
             else:
                 retry[t] = protect_numbers(t, items)
@@ -400,6 +561,32 @@ class Translator:
                 o = outs[t2]
                 res[t] = o if o and ph_ids(o) == ph_ids(t2) else None
         return res
+
+    @staticmethod
+    def _sentences(t):
+        return [m.group(2).strip() for m in SENT_RE.finditer(t) if m.group(2).strip()]
+
+    def _insane(self, t, o, tgt, count=True):
+        """Why an output is rejected ("script" / "length") or None. Source-verbatim tokens (brands,
+        units) and placeholders do not count against the target script."""
+        eng = self.engine
+        if eng.script_check:
+            known = {w.lower() for w in re.findall(r"[^\W\d_]+", PH_RE.sub(" ", t))}
+            rest = " ".join(w for w in re.findall(r"[^\W\d_]+", PH_RE.sub(" ", o)) if w.lower() not in known)
+            ar, lat = len(AR_RE.findall(rest)), len(LAT_RE.findall(rest))
+            bad = bool(ar + lat) and not (ar > lat if tgt == "ar" else lat > ar)
+            if not ar + lat:  # nothing new: an echo of a real sentence is a failure, a brand name is not
+                norm = lambda x: " ".join(PH_RE.sub(" ", x).lower().split())  # noqa: E731
+                bad = len(norm(o).split()) >= 4 and norm(o) == norm(t)
+            if bad:
+                if count:
+                    STATS["script_retry"] += 1
+                return "script"
+        if eng.len_check and (len(o) > 3 * len(t) + 40 or (len(t) > 60 and len(o) < len(t) / 5)):
+            if count:
+                STATS["len_reject"] += 1
+            return "length"
+        return None
 
     @staticmethod
     def _droppable(s, items):
@@ -462,7 +649,7 @@ class Translator:
         if script_matches(prot, tgt):
             return text
         prot = apply_glossary(prot, items, src, tgt)
-        parsed = parse(prot)
+        parsed = parse(prot, self.engine.piece_cap, self.engine.split_sentences)
         todo = sorted({p for it in parsed if isinstance(it, tuple) for p in it[1] if needs_model(p)},
                       key=len)
         done = self._run(todo, src, tgt, items)
@@ -577,7 +764,7 @@ SAMPLES = [
 def selftest(tr):
     for text, s, t in (("Hello", "en", "ar"), ("مرحبا", "ar", "en")):  # warm-up, not counted
         tr.field(text, s, t)
-    for k in ("chars", "model_s", "kept", "split", "num_retry", "fmt_dropped"):
+    for k in ("chars", "model_s", "kept", "split", "num_retry", "fmt_dropped", "script_retry", "len_reject"):
         STATS[k] = type(STATS[k])()
     for text, s, t in SAMPLES:
         out = tr.field(text, s, t)
@@ -589,7 +776,8 @@ def summary(wall):
     log("---- summary ----")
     log(f"jobs done: {STATS['done']}  jobs failed: {STATS['failed']}  "
         f"pieces split at placeholders: {STATS['split']}  segments kept untranslated: {STATS['kept']}  "
-        f"num_retry: {STATS['num_retry']}  fmt_dropped: {STATS['fmt_dropped']}")
+        f"num_retry: {STATS['num_retry']}  fmt_dropped: {STATS['fmt_dropped']}  "
+        f"script_retry: {STATS['script_retry']}  len_reject: {STATS['len_reject']}")
     log(f"characters translated: {STATS['chars']}  seconds loading model: {STATS['load_s']:.1f}  "
         f"seconds in translate_batch: {STATS['model_s']:.1f}  chars/sec: {cps:.1f}  wall seconds: {wall:.1f}")
 
@@ -609,6 +797,11 @@ def main():
     tr = Translator(engine, int(os.environ.get("YK_BATCH", "16") or 16))
     start = time.time()
     log(f"engine={engine.name} batch={tr.batch} cpus={os.cpu_count()}")
+    try:
+        engine.start()
+    except RuntimeError as e:
+        log(f"FATAL: {e}")
+        return 2
 
     if args.selftest:
         selftest(tr)
