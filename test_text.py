@@ -52,7 +52,8 @@ class EmptyEngine(KeepEngine):
 
 
 def fresh(engine_cls=KeepEngine):
-    for k in ("chars", "model_s", "load_s", "kept", "split", "num_retry", "fmt_dropped"):
+    for k in ("chars", "model_s", "load_s", "kept", "split", "num_retry", "fmt_dropped",
+              "script_retry", "len_reject", "natural_ok", "protected_retry", "glossary_miss"):
         tw.STATS[k] = type(tw.STATS[k])()
     eng = engine_cls()
     return tw.Translator(eng, 16), eng
@@ -308,7 +309,7 @@ class ScriptEngine(tw.Engine):
 
 def with_engine(eng):
     for k in ("chars", "model_s", "load_s", "kept", "split", "num_retry", "fmt_dropped",
-              "script_retry", "len_reject", "natural_ok", "protected_retry"):
+              "script_retry", "len_reject", "natural_ok", "protected_retry", "glossary_miss"):
         tw.STATS[k] = type(tw.STATS[k])()
     return tw.Translator(eng, 16)
 
@@ -460,10 +461,67 @@ class InventEngine(KeepEngine):
 # ---- 29. split fallback: a segment with invented digits keeps its source
 tr, eng = fresh(InventEngine)
 out = tr.field("Call 5555 1234 today", "en", "ar")
-assert out == "Call 5555 1234 today" and tw.STATS["kept"] == 2 and tw.STATS["split"] == 1, (out, tw.STATS)
+assert out == "Call 5555 1234 today" and tw.STATS["kept"] == 1 and tw.STATS["split"] == 1, (out, tw.STATS)
 print("ok 29 split segments keep digits strict")
 
 assert tw.TGemmaEngine.natural_first and not any(
     getattr(tw.ENGINES[n], "natural_first", False) for n in ("opus", "m2m100", "m2m100-big", "madlad"))
 print("ok 30 natural_first only for tgemma")
+
+# ---- 31. numbers are compared by value
+ok, no = tw.numbers_ok, lambda *a, **k: not tw.numbers_ok(*a, **k)
+assert ok("ماشية 120 ألف كم", "mileage 120,000 km") and ok("ماشية 120 ألف كم", "120 thousand km")
+assert ok("6,200 دينار", "6200 dinars") and ok("Open 11:00 am", "مفتوح 11 صباحاً") and ok("3-bedroom flat", "شقة 3 غرف")
+assert ok("استعمال سنتين فقط، السعر 60", "used for only 2 years, priced at 60")  # number word -> digit
+assert ok("Minimum two years, salary 500", "الحد الأدنى 2 سنوات، الراتب 500")
+assert ok("12 ظهراً حتى 12 منتصف الليل", "12 noon until midnight")  # a repeated value may be written once
+assert ok("الصف الثاني عشر", "12th grade") and ok("Open 24/7", "مفتوح 24/7")
+assert ok("السعر 2,5 دينار", "price 2.5 dinars")
+assert no("السعر 60", "price 50") and no("السعر 60 دينار", "priced in dinars")  # a price must not change or vanish
+assert no("Rent 450", "450 and 20") and no("Rent 450 per month", "الإيجار 45 شهريا")
+assert no("Call us", "5 minutes") is True
+assert ok("a", "b", strict=True) and no("Rent 450", "Rent 450 and 2", strict=True)
+assert tw.number_values("1,234.5 and ٣٫٥ and 2 million") == {1234.5, 3.5, 2e6}
+print("ok 31 numbers by value")
+
+# ---- 32. natural-first final choice: translation, natural output, or the whole source; never a mix
+src_t = "Rent 450 KWD per month."
+prot_t = "Rent 450 QXAXQ per month."
+tr = with_engine(NatEngine({src_t: "الإيجار 450 دولار شهريا.", prot_t: "الإيجار 450 QXAXQ شهريا."}))
+assert tr.field(src_t, "en", "ar") == "الإيجار 450 دينار كويتي شهريا." and tw.STATS["glossary_miss"] == 0  # (ii)
+tr = with_engine(NatEngine({src_t: "الإيجار 450 دولار شهريا.", prot_t: "Rent QXAXQ monthly please"}))
+out = tr.field(src_t, "en", "ar")  # protected answer is not Arabic: (iii) natural output, glossary missed
+assert out == "الإيجار 450 دولار شهريا." and tw.STATS["glossary_miss"] == 1 and tw.STATS["kept"] == 0, (out, tw.STATS)
+tr = with_engine(NatEngine({src_t: "الإيجار 40 دولار شهريا.", prot_t: "Rent QXAXQ monthly please"}))
+out = tr.field(src_t, "en", "ar")  # numbers wrong AND protected unusable: (iv) the whole source piece
+assert out == src_t and tw.STATS["kept"] == 1 and "دينار" not in out, (out, tw.STATS)
+# a piece the protected path could only half translate is kept whole, glossary terms in their source form
+tr, eng = fresh(InventEngine)
+out = tr.field("Rent in Salmiya call 5555 1234 today", "en", "ar")
+assert out == "Rent in Salmiya call 5555 1234 today" and tw.STATS["kept"] == 1, (out, tw.STATS)
+print("ok 32 no mixed pieces")
+
+# ---- 33. natural answers that only rewrite numbers harmlessly are accepted
+tr = with_engine(NatEngine({"للبيع سيارة ماشية 120 ألف كم، السعر 6,200 دينار": "Car for sale, 120,000 km, price 6200 dinars",
+                            "استعمال سنتين فقط، السعر 60 دينار": "Used for only 2 years, priced at 60 dinars"}))
+assert tr.field("للبيع سيارة ماشية 120 ألف كم، السعر 6,200 دينار", "ar", "en").startswith("Car for sale")
+assert tr.field("استعمال سنتين فقط، السعر 60 دينار", "ar", "en").startswith("Used for only 2")
+assert tw.STATS["natural_ok"] == 2 and tw.STATS["protected_retry"] == 0, tw.STATS
+print("ok 33 harmless number rewrites")
+
+# ---- 34. YK_DEBUG lines (only with YK_DEBUG=1)
+import contextlib  # noqa: E402
+import io  # noqa: E402
+
+for flag, want in (("1", True), ("0", False)):
+    os.environ["YK_DEBUG"] = flag
+    tr = with_engine(NatEngine({src_t: "الإيجار 450 دولار شهريا.", prot_t: "الإيجار 450 QXAXQ شهريا."}))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        tr.field(src_t, "en", "ar")
+    text = buf.getvalue()
+    assert ("DEBUG natural rejected [glossary:دينار كويتي]" in text) == want, text
+    assert ("DEBUG" in text) == want
+os.environ.pop("YK_DEBUG")
+print("ok 34 debug lines")
 print("ALL TESTS PASSED")

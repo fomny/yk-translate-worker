@@ -46,12 +46,38 @@ SENT_CAP = 400
 
 STATS = {"done": 0, "failed": 0, "chars": 0, "model_s": 0.0, "load_s": 0.0, "kept": 0, "split": 0,
          "num_retry": 0, "fmt_dropped": 0, "script_retry": 0, "len_reject": 0,
-         "natural_ok": 0, "protected_retry": 0}
+         "natural_ok": 0, "protected_retry": 0, "glossary_miss": 0}
 GLOSS = {}  # source language -> (compiled regex, lookup); filled by load_glossary()
 
 
 def log(msg):
     print(time.strftime("%H:%M:%S"), msg, flush=True)
+
+
+def dbg(msg):
+    """Extra diagnostics, only when YK_DEBUG=1."""
+    if os.environ.get("YK_DEBUG") == "1":
+        log("DEBUG " + msg)
+
+
+def cut(s, n=160):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[:n - 3] + "..."
+
+
+class Items(list):
+    """The protected items of one field. `orig` maps the text that replaced a glossary or time match
+    (prefix word + placeholder) back to the source text, for pieces that must stay untranslated."""
+
+    def __init__(self, *a):
+        super().__init__(*a)
+        self.orig = {}
+
+
+def unglossary(piece, items):
+    for k, v in getattr(items, "orig", {}).items():
+        piece = piece.replace(k, v)
+    return piece
 
 
 # ---------------------------------------------------------------- text handling
@@ -60,7 +86,7 @@ def ph(i):
 
 
 def protect(text):
-    items = []
+    items = Items()
 
     def sub(m):
         s, tail = m.group(0), ""
@@ -110,6 +136,64 @@ def restore(text, items):
 
 def digit_runs(s):
     return sorted(re.findall(r"\d+", s.translate(DIGIT_MAP)))
+
+
+# ---- numbers compared by value
+NUM_TOKEN = re.compile(
+    r"(\d{1,2}):(\d{2})(?!\d)"
+    r"|(\d{1,3}(?:[,٬]\d{3})+(?:[.٫]\d+)?|\d+(?:[.٫,]\d{1,2}(?!\d))?)"
+    r"(?:\s*(ألف|آلاف|الاف|thousand|k|مليون|ملايين|million)(?!\w))?", re.I)
+_MULT = {"ألف": 1e3, "آلاف": 1e3, "الاف": 1e3, "thousand": 1e3, "k": 1e3,
+         "مليون": 1e6, "ملايين": 1e6, "million": 1e6}
+_EN_WORDS = dict(one=1, two=2, three=3, four=4, five=5, six=6, seven=7, eight=8, nine=9, ten=10, eleven=11,
+                 twelve=12, twenty=20, thirty=30, hundred=100, first=1, second=2, third=3, fourth=4, fifth=5,
+                 sixth=6, seventh=7, eighth=8, ninth=9, tenth=10, eleventh=11, twelfth=12, half=0.5,
+                 twice=2, double=2, couple=2)
+_AR_WORDS = {"واحد": 1, "واحدة": 1, "اثنين": 2, "اثنان": 2, "اثنتين": 2, "اثنتان": 2, "ثنتين": 2,
+             "ثلاث": 3, "ثلاثة": 3, "اربع": 4, "أربع": 4, "أربعة": 4, "اربعة": 4, "خمس": 5, "خمسة": 5,
+             "ست": 6, "ستة": 6, "سبع": 7, "سبعة": 7, "ثمان": 8, "ثماني": 8, "ثمانية": 8, "تسع": 9, "تسعة": 9,
+             "عشر": 10, "عشرة": 10, "عشرين": 20, "ثلاثين": 30, "مئة": 100, "مائة": 100,
+             "سنتين": 2, "شهرين": 2, "يومين": 2, "مرتين": 2, "اسبوعين": 2, "أسبوعين": 2, "ساعتين": 2,
+             "عامين": 2, "الثاني": 2, "الثالث": 3, "الرابع": 4, "الخامس": 5, "الأول": 1, "الاول": 1,
+             "نصف": 0.5}
+_AR_PAIRS = {"الثاني عشر": 12, "الحادي عشر": 11, "الثالث عشر": 13}
+
+
+def number_values(text):
+    """Set of the numeric values in text: separators removed, `120 ألف`/`120 thousand` = 120000,
+    `11:00` = 11 (a time with minutes 30 is 11.3, so it differs from 11)."""
+    out = set()
+    for m in NUM_TOKEN.finditer(text.translate(DIGIT_MAP)):
+        if m.group(1):
+            out.add(int(m.group(1)) + int(m.group(2)) / 100)
+            continue
+        n = m.group(3)
+        if re.fullmatch(r"\d+,\d{1,2}", n):  # decimal comma: 2,5
+            n = n.replace(",", ".")
+        n = n.replace(",", "").replace("٬", "").replace("٫", ".")
+        out.add(float(n) * _MULT.get((m.group(4) or "").lower(), 1))
+    return out
+
+
+def word_values(text):
+    vals = {v for k, v in _AR_PAIRS.items() if k in text}
+    for w in re.findall(r"[^\W\d_]+", text.lower()):
+        if w in _EN_WORDS:
+            vals.add(_EN_WORDS[w])
+        for c in (w, w[1:] if w[:1] in "وبلفك" else w, w[2:] if w.startswith("ال") else w,
+                  w[3:] if w[:1] in "وبلفك" and w[1:3] == "ال" else w):
+            if c in _AR_WORDS:
+                vals.add(_AR_WORDS[c])
+    return vals
+
+
+def numbers_ok(src, out, strict=False):
+    """Every source value is in the output (or the output spells it as a number word); a value that is
+    only in the output needs the matching number word in the source. strict: the sets must be equal."""
+    s, o = number_values(src), number_values(out)
+    if strict:
+        return s == o
+    return all(v in word_values(out) for v in s - o) and all(v in word_values(src) for v in o - s)
 
 
 def protect_numbers(piece, items):
@@ -285,7 +369,7 @@ def load_glossary(path):
             continue
         n += 1
         k = len(entries)
-        entries.append({"en": en + en_ok, "ar": ar + ar_ok})  # forms accepted in an output
+        entries.append({"en": en + en_ok, "ar": ar + ar_ok})  # forms accepted in an output; [0] = first form
         for v in en:
             en_map.setdefault(_norm_en(v), _norm_ar(ar[0]))
             en_idx.setdefault(_norm_en(v), k)
@@ -322,7 +406,9 @@ def apply_glossary(prot, items, src, tgt):
             if val is None:
                 return m.group(0)
             items.append(val)
-            return ph(len(items) - 1)
+            rep = ph(len(items) - 1)
+            getattr(items, "orig", {})[rep] = m.group(0)
+            return rep
 
         prot = TIME_RE.sub(tsub, prot)
     g = GLOSS.get(src)
@@ -341,7 +427,9 @@ def apply_glossary(prot, items, src, tgt):
             else:
                 val, pre = ar_map[_norm_ar(m.group("form"))], AR_PRE.get(m.group("pre") or "", "")
         items.append(val)
-        return pre + ph(len(items) - 1)
+        rep = pre + ph(len(items) - 1)
+        getattr(items, "orig", {})[rep] = m.group(0)
+        return rep
 
     return rx.sub(sub, prot)
 
@@ -380,14 +468,20 @@ def _form_in(out, form, tgt):
     return re.search(pat, _norm_en(out)) is not None
 
 
-def gloss_ok(s, o, src, tgt):
-    """True when the output holds an accepted target form of every glossary entry found in the source."""
+def gloss_missing(s, o, src, tgt):
+    """First forms of the glossary entries found in the source whose accepted target forms are all
+    absent from the output."""
     entries = GLOSS.get("entries", [])
+    out = []
     for k in glossary_hits(s, src, tgt):
         forms = entries[k]["ar" if tgt == "ar" else "en"]
-        if not any(_form_in(o, f, tgt) for f in forms):
-            return False
-    return True
+        if not any(_form_in(o, f, tgt) for f in forms) and forms[0] not in out:
+            out.append(forms[0])
+    return out
+
+
+def gloss_ok(s, o, src, tgt):
+    return not gloss_missing(s, o, src, tgt)
 
 
 # ---------------------------------------------------------------- engines
@@ -595,7 +689,9 @@ ENGINES = {"opus": OpusEngine, "m2m100": M2MEngine, "m2m100-big": M2MBigEngine,
 class Translator:
     def __init__(self, engine, batch):
         self.engine, self.batch = engine, max(1, batch)
-        self._memo = {}  # (src, tgt, text) -> output, for one field only: a repeat costs no model call
+        self._memo = {}      # (src, tgt, text) -> output, for one field only: a repeat costs no model call
+        self._tainted = set()  # pieces whose result would be a mix of source and translation
+        self._why = {}       # text -> reason its output was refused (debug lines only)
 
     def _batches(self, pieces, src, tgt):
         todo = [p for p in dict.fromkeys(pieces) if (src, tgt, p) not in self._memo]
@@ -608,12 +704,14 @@ class Translator:
 
     def _checked(self, texts, src, tgt, items, strict=False):
         """-> {text: output or None}. An output is accepted only if every placeholder came back
-        and the digit runs equal the source's (digits then written 0-9). A digit mismatch is
-        redone once with the numbers protected as placeholders (STATS["num_retry"])."""
+        and the numbers (by value) agree (digits then written 0-9). A number mismatch is redone once
+        with the numbers protected as placeholders (STATS["num_retry"]). strict (split-fallback
+        segments): numbers must be identical, no retry, and a refused output is None."""
         res, retry, cand, bad = {}, {}, {}, []
         for t, o in self._batches(texts, src, tgt).items():
             if not o or ph_ids(o) != ph_ids(t):
                 res[t] = None
+                self._why[t] = "empty" if not o else "placeholders"
             elif self._insane(t, o, tgt):
                 bad.append(t)
                 cand[t] = o
@@ -628,15 +726,22 @@ class Translator:
                 if o and ph_ids(o) == ph_ids(t) and not self._insane(t, o, tgt, count=False):
                     cand[t] = o
                     bad.remove(t)
-        for t in bad:  # still failing: keep the source piece
+        for t in bad:  # still failing
+            self._why[t] = self._insane(t, cand[t], tgt, count=False) or "script"
             del cand[t]
-            res[t] = t
-            STATS["kept"] += 1
-            log(f"output failed the script/length check, kept untranslated: {t[:60]!r}")
+            if strict:
+                res[t] = None
+            else:  # keep the source piece (a whole piece, never half of one)
+                res[t] = t
+                self._tainted.add(t)
+                log(f"output failed the script/length check, kept untranslated: {t[:60]!r}")
         for t, o in cand.items():
-            if strict:  # split-fallback segment: digits must match exactly, no retry
-                res[t] = o.translate(DIGIT_MAP) if digit_runs(o) == digit_runs(t) else None
-            elif not digit_runs(t) or digit_runs(o) == digit_runs(t):
+            if strict:
+                ok = numbers_ok(t, o, strict=True)
+                res[t] = o.translate(DIGIT_MAP) if ok else None
+                if not ok:
+                    self._why[t] = "digits"
+            elif not number_values(t) or numbers_ok(t, o):
                 res[t] = o.translate(DIGIT_MAP)
             else:
                 retry[t] = protect_numbers(t, items)
@@ -646,6 +751,8 @@ class Translator:
             for t, t2 in retry.items():
                 o = outs[t2]
                 res[t] = o if o and ph_ids(o) == ph_ids(t2) else None
+                if res[t] is None:
+                    self._why[t] = "placeholders after number retry"
         return res
 
     @staticmethod
@@ -683,28 +790,62 @@ class Translator:
             and not items[i].lower().startswith(("<yk-keep", "</yk-keep"))
             for i in ids)
 
-    def _natural_ok(self, s, o, src, tgt):
-        return bool(o) and ph_ids(o) == ph_ids(s) and not self._insane(s, o, tgt, count=False) \
-            and (not digit_runs(s) or digit_runs(o) == digit_runs(s)) and gloss_ok(s, o, src, tgt)
+    def _natural_issues(self, s, o, src, tgt):
+        """Names of the checks a natural answer fails (empty list: accept)."""
+        if not o:
+            return ["empty"]
+        out = []
+        if ph_ids(o) != ph_ids(s):
+            out.append("placeholders")
+        why = self._insane(s, o, tgt, count=False)
+        if why:
+            out.append(why)
+        if number_values(s) and not numbers_ok(s, o):
+            out.append("digits")
+        out += ["glossary:" + f for f in gloss_missing(s, o, src, tgt)]
+        return out
 
     def _run(self, pieces, src, tgt, items):
-        """natural_first engines: translate the natural piece (only structure protected) and verify it;
-        pieces that fail are redone with glossary/time items by the protected method."""
-        if not self.engine.natural_first:
-            return self._run_protected(pieces, src, tgt, items)
-        done, redo = {}, {}
-        for s, o in self._batches(pieces, src, tgt).items():
-            if self._natural_ok(s, o, src, tgt):
-                done[s] = o.translate(DIGIT_MAP)
-                STATS["natural_ok"] += 1
-            else:
-                redo[s] = apply_glossary(s, items, src, tgt)
-        if redo:
+        """-> {piece: result}. Never a mix of source and translation inside one piece.
+        natural_first engines: (i) the natural answer if it passes every check; else (ii) the protected
+        answer if it has no kept segment; else (iii) the natural answer when only the glossary check
+        failed (STATS["glossary_miss"]); else (iv) the whole source piece (STATS["kept"])."""
+        natural = self.engine.natural_first
+        done, redo, issues, nat_out = {}, {}, {}, {}
+        if natural:
+            for s, o in self._batches(pieces, src, tgt).items():
+                bad = self._natural_issues(s, o, src, tgt)
+                if not bad:
+                    done[s] = o.translate(DIGIT_MAP)
+                    STATS["natural_ok"] += 1
+                else:
+                    issues[s], nat_out[s] = bad, o
+                    redo[s] = apply_glossary(s, items, src, tgt)
+                    dbg(f"natural rejected [{', '.join(bad)}] src={cut(s)!r} out={cut(o)!r}")
+            todo = sorted({v for v in redo.values() if needs_model(v)}, key=len)
             STATS["protected_retry"] += len(redo)
-            res = self._run_protected(sorted({v for v in redo.values() if needs_model(v)}, key=len),
-                                      src, tgt, items)
-            for s, v in redo.items():
-                done[s] = res.get(v, v)
+        else:
+            todo = pieces
+        res = self._run_protected(todo, src, tgt, items) if todo else {}
+        if not natural:
+            for s in pieces:
+                if s in self._tainted:
+                    res[s] = unglossary(s, items)  # the whole source piece, not half of it
+                    STATS["kept"] += 1
+            return res
+        for s, v in redo.items():
+            if not needs_model(v):
+                done[s] = v
+            elif v in res and v not in self._tainted:
+                done[s] = res[v]                                   # (ii)
+            elif all(b.startswith("glossary:") for b in issues[s]):
+                done[s] = nat_out[s].translate(DIGIT_MAP)            # (iii)
+                STATS["glossary_miss"] += 1
+                dbg(f"glossary miss accepted: {issues[s]} src={cut(s)!r}")
+            else:
+                done[s] = s                                        # (iv)
+                STATS["kept"] += 1
+                log(f"piece kept untranslated (no complete translation): {cut(s, 60)!r}")
         return done
 
     def _run_protected(self, pieces, src, tgt, items):
@@ -717,7 +858,7 @@ class Translator:
             if drop:
                 r3 = self._checked(sorted(set(drop.values()), key=len), src, tgt, items)
                 for s, t in drop.items():
-                    if r3[t] is not None:
+                    if r3[t] is not None and t not in self._tainted:
                         done[s] = r3[t]
                         STATS["fmt_dropped"] += 1
                 fail = [s for s in fail if s not in done]
@@ -725,10 +866,10 @@ class Translator:
         for s in fail:  # split at placeholders (numbers too, when only they were the problem)
             if PH_RE.search(s):
                 plan[s] = split_at_ph(s)
-            elif digit_runs(s):
+            elif number_values(s):
                 plan[s] = split_at_ph(protect_numbers(s, items))
             else:
-                STATS["kept"] += 1
+                self._tainted.add(s)
                 log(f"empty output, piece kept untranslated: {s[:60]!r}")
                 done[s] = s
         if plan:
@@ -737,19 +878,22 @@ class Translator:
             seg_out = self._checked(segs, src, tgt, items, strict=True)
             for s, parts in plan.items():
                 STATS["split"] += 1
-                out = ""
+                out, lost = "", False
                 for k, t in parts:
                     seg = t.strip()
                     if k == "t" and seg in seg_out:
                         o = seg_out[seg]
                         if o is None:
-                            STATS["kept"] += 1
-                            log(f"segment output unusable, kept untranslated: {seg[:60]!r}")
+                            lost = True
+                            log(f"segment output unusable: {seg[:60]!r}")
+                            dbg(f"segment kept, reason={self._why.get(seg, '?')}: {cut(seg)!r}")
                             o = seg
                         out += (" " if t[:1].isspace() else "") + o + (" " if t[-1:].isspace() else "")
                     else:
                         out += t
                 done[s] = out.strip()
+                if lost:  # half a translation is worse than none: the caller keeps the whole piece
+                    self._tainted.add(s)
         return done
 
     def field(self, text, src, tgt):
@@ -759,6 +903,8 @@ class Translator:
         if script_matches(prot, tgt):
             return text
         self._memo.clear()
+        self._tainted.clear()
+        self._why.clear()
         if not self.engine.natural_first:  # natural-first engines see the plain sentence first
             prot = apply_glossary(prot, items, src, tgt)
         parsed = parse(prot, self.engine.piece_cap, self.engine.split_sentences)
@@ -877,7 +1023,7 @@ def selftest(tr):
     for text, s, t in (("Hello", "en", "ar"), ("مرحبا", "ar", "en")):  # warm-up, not counted
         tr.field(text, s, t)
     for k in ("chars", "model_s", "kept", "split", "num_retry", "fmt_dropped", "script_retry", "len_reject",
-              "natural_ok", "protected_retry"):
+              "natural_ok", "protected_retry", "glossary_miss"):
         STATS[k] = type(STATS[k])()
     for text, s, t in SAMPLES:
         out = tr.field(text, s, t)
@@ -891,7 +1037,8 @@ def summary(wall):
         f"pieces split at placeholders: {STATS['split']}  segments kept untranslated: {STATS['kept']}  "
         f"num_retry: {STATS['num_retry']}  fmt_dropped: {STATS['fmt_dropped']}  "
         f"script_retry: {STATS['script_retry']}  len_reject: {STATS['len_reject']}  "
-        f"natural_ok: {STATS['natural_ok']}  protected_retry: {STATS['protected_retry']}")
+        f"natural_ok: {STATS['natural_ok']}  protected_retry: {STATS['protected_retry']}  "
+        f"glossary_miss: {STATS['glossary_miss']}")
     log(f"characters translated: {STATS['chars']}  seconds loading model: {STATS['load_s']:.1f}  "
         f"seconds in translate_batch: {STATS['model_s']:.1f}  chars/sec: {cps:.1f}  wall seconds: {wall:.1f}")
 

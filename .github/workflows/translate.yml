@@ -139,6 +139,8 @@ jobs:
 
       - name: Selftest
         if: steps.check.outputs.run == 'true' && env.SELFTEST == 'true'
+        env:
+          YK_DEBUG: "1"
         run: python translate_worker.py --selftest
 
       - name: Translate pending jobs
