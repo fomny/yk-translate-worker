@@ -684,4 +684,95 @@ tr = with_engine(KeepEngine())
 assert tr.field(5, "en", "ar") == 5 and tr.field(None, "en", "ar") is None and tr.field(["a"], "en", "ar") == ["a"]
 assert tr.field("", "en", "ar") == ""
 print("ok 35 REST handling")
+
+# ---- 36. invented filler and Markdown are refused (attempt 1, and any engine's final answer)
+fi = tw.filler_issue
+assert fi("للتواصل 5555 1234", "Contact: [Your Contact Information] 5555 1234") == "invention"
+assert fi("a", "see {placeholder}") == "invention" and fi("a", "<name> here") == "invention"
+assert fi("a [x] b", "a [x] b") is None and fi("Our QXAXQ", "<br> و") == "invention"  # raw tags are stripped before
+assert fi("اتصل", "Please insert your card") == "invention" and fi("أدخل البطاقة", "Insert the card") is None
+assert fi("a", "your contact information") == "invention" and fi("a", "اكتب هنا") == "invention"
+assert fi("سعر", "price: write here") is None  # not a listed phrase
+assert fi("a", "We offer the **best** repair") == "markdown" and fi("a **b**", "x **y**") is None
+assert fi("a", "# Title\ntext") == "markdown" and fi("a", "- one\n- two") == "markdown" and fi("a", "* x") == "markdown"
+assert fi("a", "```\ncode\n```") == "markdown" and fi("- a", "- b") is None
+assert fi("a", "plain - dash and 5 * 3 and a #hashtag") is None
+tr = with_engine(NatEngine(lambda t: "Contact: [Your Contact Information] +965 2222 3333 today"
+                           if "+965" in t else "Call QXAXQ today"))
+out = tr.field("اتصل على +965 2222 3333 اليوم", "ar", "en")
+assert "[Your" not in out and tw.STATS["protected_retry"] == 1 and out == "Call +965 2222 3333 today", (out, tw.STATS)
+buf = io.StringIO()
+os.environ["YK_DEBUG"] = "1"
+tr = with_engine(NatEngine(lambda t: "We offer **best** repairs" if "<" in t else "We offer QXAXQbestQXBXQ repairs"))
+with contextlib.redirect_stdout(buf):
+    tr.field("<b>أفضل</b> إصلاح", "ar", "en")
+os.environ.pop("YK_DEBUG")
+assert "[structure, markdown]" in buf.getvalue() or "markdown" in buf.getvalue(), buf.getvalue()
+class FillerFinal(tw.Engine):  # a non-natural engine's final answer is checked as well
+    name = "f"
+
+    def translate(self, texts, src, tgt):
+        return ["Call [Your Contact Information] now" for t in texts]
+
+
+tr = with_engine(FillerFinal())
+assert tr.field("اتصل بنا الآن من فضلك", "ar", "en") == "اتصل بنا الآن من فضلك" and tw.STATS["kept"] == 1
+print("ok 36 invention and markdown")
+
+# ---- 37. directory terms, two ways; generic single words stay with the model
+tr = with_engine(NatEngine({}))
+for en_, ar_ in (("dental clinic", "عيادة أسنان"), ("car wash", "مغسلة سيارات"), ("beauty salon", "صالون تجميل"),
+                 ("real estate office", "مكتب عقاري"), ("spare parts", "قطع غيار"), ("laundry", "مصبغة"),
+                 ("barber shop", "صالون حلاقة"), ("gym", "نادي رياضي"), ("coffee shop", "مقهى")):
+    assert tr.field(en_, "en", "ar") == ar_, en_
+    assert tr.field(ar_, "ar", "en") == en_.replace("coffee shop", "cafe"), ar_
+assert "laundry" in tr.field("للمصبغة", "ar", "en")  # attached prefix
+assert tw.glossary_hits("restaurant hotel clinic school hospital bakery pharmacy", "en", "ar") == []
+assert tw.glossary_hits("نادي لياقة", "ar", "en") == []  # an ar_ok form is accepted in output only
+assert tw.glossary_hits("حضانة", "ar", "en") == [] and tw.glossary_hits("nursery", "en", "ar")  # ambiguous: en->ar only
+assert tw.gloss_ok("our dental clinic", "عيادتنا عيادة الأسنان", "en", "ar")
+assert tw.gloss_ok("The best car wash", "أفضل غسيل السيارات", "en", "ar")
+assert not tw.gloss_ok("our dental clinic", "عيادتنا للدفاع", "en", "ar")
+print("ok 37 directory terms")
+
+# ---- 38. Ollama options and the model's own numbers
+posted = []
+
+
+class FakeHTTP:
+    status_code = 200
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return {"message": {"content": "مرحبا"}, "prompt_eval_count": 40, "prompt_eval_duration": 2_000_000_000,
+                "eval_count": 10, "eval_duration": 5_000_000_000}
+
+
+real_post = getattr(tw.requests, "post", None)
+tw.requests.post = lambda url, json=None, timeout=None: (posted.append(json), FakeHTTP())[1]
+try:
+    for k in ("model_calls", "prompt_tokens", "prompt_s", "gen_tokens", "gen_s"):
+        tw.STATS[k] = type(tw.STATS[k])()
+    os.environ.pop("YK_OLLAMA_THREADS", None)
+    g = tw.TGemmaEngine()
+    assert g.translate(["Hello", "Bye"], "en", "ar") == ["مرحبا", "مرحبا"]
+    o = posted[0]["options"]
+    assert o["num_thread"] == (os.cpu_count() or 2) and o["num_ctx"] == 2048 and o["temperature"] == 0 and o["seed"] == 42
+    assert tw.STATS["model_calls"] == 2 and tw.STATS["prompt_tokens"] == 80 and tw.STATS["gen_tokens"] == 20
+    assert abs(tw.STATS["prompt_s"] - 4.0) < 1e-9 and abs(tw.STATS["gen_s"] - 10.0) < 1e-9
+    os.environ["YK_OLLAMA_THREADS"] = "3"
+    assert tw.TGemmaEngine().threads == 3
+    os.environ.pop("YK_OLLAMA_THREADS")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        tw.summary(10.0)
+    assert "model calls: 2" in buf.getvalue() and "(20.0 tokens/s)" in buf.getvalue() and "(2.0 tokens/s)" in buf.getvalue()
+finally:
+    if real_post is None:
+        del tw.requests.post
+    else:
+        tw.requests.post = real_post
+print("ok 38 ollama options and stats")
 print("ALL TESTS PASSED")

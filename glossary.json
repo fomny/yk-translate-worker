@@ -85,5 +85,15 @@
   {"en": ["GMC Yukon"], "ar": ["جي إم سي يوكن", "جمس يوكن"], "ar_ok": ["جي ام سي يوكن", "جي إم سي يوكون"], "ar_ambiguous": false},
   {"en": ["Mitsubishi Pajero"], "ar": ["ميتسوبيشي باجيرو"], "ar_ok": ["ميتسوبشي باجيرو"], "ar_ambiguous": false},
   {"en": ["Samsung"], "ar": ["سامسونج", "سامسونغ"], "ar_ambiguous": false},
-  {"en": ["iPhone"], "ar": ["آيفون"], "ar_ok": ["ايفون", "أيفون", "آي فون"], "ar_ambiguous": false}
+  {"en": ["iPhone"], "ar": ["آيفون"], "ar_ok": ["ايفون", "أيفون", "آي فون"], "ar_ambiguous": false},
+  {"en": ["dental clinic", "dental clinics"], "ar": ["عيادة أسنان"], "ar_ok": ["عيادة الأسنان", "عيادات أسنان", "عيادة طب الأسنان"], "ar_ambiguous": false},
+  {"en": ["car wash"], "ar": ["مغسلة سيارات"], "ar_ok": ["مغسلة السيارات", "مغسلة للسيارات", "غسيل سيارات", "غسيل السيارات"], "ar_ambiguous": false},
+  {"en": ["beauty salon", "beauty salons"], "ar": ["صالون تجميل"], "ar_ok": ["صالون التجميل", "صالون نسائي", "مركز تجميل"], "ar_ambiguous": false},
+  {"en": ["real estate office", "real estate agency"], "ar": ["مكتب عقاري"], "ar_ok": ["المكتب العقاري", "مكتب عقارات", "مكتب عقاري"], "ar_ambiguous": false},
+  {"en": ["spare parts"], "ar": ["قطع غيار"], "ar_ok": ["قطع الغيار"], "ar_ambiguous": false},
+  {"en": ["laundry"], "ar": ["مصبغة", "مغسلة ملابس"], "ar_ok": ["مغسلة", "المصبغة", "مغسلة الملابس"], "ar_ambiguous": false},
+  {"en": ["barber shop", "barbershop"], "ar": ["صالون حلاقة"], "ar_ok": ["صالون الحلاقة", "محل حلاقة", "حلاق"], "ar_ambiguous": false},
+  {"en": ["gym"], "ar": ["نادي رياضي", "جيم"], "ar_ok": ["النادي الرياضي", "نادي لياقة", "صالة رياضية"], "ar_ambiguous": false},
+  {"en": ["nursery"], "ar": ["حضانة"], "ar_ok": ["الحضانة", "حضانة أطفال"], "ar_ambiguous": true},
+  {"en": ["cafe", "café", "coffee shop"], "ar": ["مقهى", "كافيه", "كوفي شوب"], "ar_ok": ["المقهى", "كافي"], "ar_ambiguous": false}
 ]

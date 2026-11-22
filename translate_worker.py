@@ -46,7 +46,8 @@ SENT_CAP = 400
 
 STATS = {"done": 0, "failed": 0, "chars": 0, "model_s": 0.0, "load_s": 0.0, "kept": 0, "split": 0,
          "num_retry": 0, "fmt_dropped": 0, "script_retry": 0, "len_reject": 0,
-         "inline_ok": 0, "protected_retry": 0, "glossary_miss": 0, "skipped": 0}
+         "inline_ok": 0, "protected_retry": 0, "glossary_miss": 0, "skipped": 0,
+         "model_calls": 0, "prompt_tokens": 0, "prompt_s": 0.0, "gen_tokens": 0, "gen_s": 0.0}
 GLOSS = {}  # source language -> (compiled regex, lookup); filled by load_glossary()
 
 
@@ -449,7 +450,9 @@ def load_glossary(path):
             en_idx.setdefault(_norm_en(v), k)
         if not amb:  # an ordinary Arabic word is only replaced English -> Arabic
             for v in ar:
-                for w in _ar_variants(v):
+                ws = set(_ar_variants(v))
+                ws |= {"ال" + w for w in ws if " " not in w and not w.startswith("ال")}  # with the article
+                for w in ws:
                     ar_map.setdefault(w, en[0])
                     ar_idx.setdefault(w, k)
                     if w.startswith("ال") and len(w) > 3:
@@ -733,6 +736,8 @@ class TGemmaEngine(Engine):
 
     def __init__(self, model_dir=None):
         self.url = (os.environ.get("YK_OLLAMA_URL") or "http://127.0.0.1:11434").rstrip("/")
+        # num_thread: Ollama's default is not documented on the pages read; ask for every CPU explicitly
+        self.threads = int(os.environ.get("YK_OLLAMA_THREADS") or os.cpu_count() or 2)
 
     def start(self):
         try:
@@ -749,18 +754,52 @@ class TGemmaEngine(Engine):
         for t in texts:
             body = {"model": self.MODEL, "stream": False, "keep_alive": "3h",
                     "messages": [{"role": "user", "content": self.prompt(t, src, tgt)}],
-                    "options": {"temperature": 0, "seed": 42, "num_ctx": 2048,
+                    "options": {"temperature": 0, "seed": 42, "num_ctx": 2048, "num_thread": self.threads,
                                 "num_predict": min(1024, max(64, 3 * (len(t) // 3 + 1)))}}
             t0 = time.time()
             r = requests.post(self.url + "/api/chat", json=body, timeout=180)
             STATS["model_s"] += time.time() - t0
             r.raise_for_status()
-            out.append(clean_llm(r.json().get("message", {}).get("content", ""), t))
+            data = r.json()
+            STATS["model_calls"] += 1  # Ollama's own numbers (durations are nanoseconds)
+            STATS["prompt_tokens"] += int(data.get("prompt_eval_count") or 0)
+            STATS["prompt_s"] += (data.get("prompt_eval_duration") or 0) / 1e9
+            STATS["gen_tokens"] += int(data.get("eval_count") or 0)
+            STATS["gen_s"] += (data.get("eval_duration") or 0) / 1e9
+            out.append(clean_llm(data.get("message", {}).get("content", ""), t))
         return out
 
 
 ENGINES = {"opus": OpusEngine, "m2m100": M2MEngine, "m2m100-big": M2MBigEngine,
            "madlad": MadladEngine, "tgemma": TGemmaEngine}
+
+
+BRACKET_RE = re.compile(r"\[[^\[\]\n]*\]|\{[^{}\n]*\}|<[A-Za-z][^<>\n]*>")
+MD_RE = re.compile(r"\*\*|__|(?m:^\s*(?:#+\s|[-*]\s))|```")
+# (template-filler phrases, words in the source that make them legitimate)
+FILLER = (
+    (("your contact information", "معلومات الاتصال الخاصة بك"), ("contact", "للتواصل", "الاتصال")),
+    (("insert ", "أدخل "), ("insert", "أدخل", "ادخل", "إدخال")),
+    (("[name]",), ()),
+    (("phone number here",), ("phone", "هاتف", "رقم")),
+    (("اكتب هنا",), ("اكتب", "write", "type")),
+)
+
+
+def filler_issue(base, o):
+    """"invention" / "markdown" when o has bracketed spans, template filler or Markdown that the
+    source did not have, else None. base is the source text the output answers."""
+    for m in BRACKET_RE.finditer(o):
+        if m.group(0) not in base:
+            return "invention"
+    low, blow = o.lower(), base.lower()
+    for phrases, exempt in FILLER:
+        if any(p in low and p not in blow for p in phrases) and not any(e in blow for e in exempt):
+            return "invention"
+    for m in MD_RE.finditer(o):
+        if not any(x.group(0).strip() == m.group(0).strip() for x in MD_RE.finditer(base)):
+            return "markdown"
+    return None
 
 
 class Translator:
@@ -845,6 +884,9 @@ class Translator:
         if eng.script_check:
             base = t if ref is None else ref
             o_s = strip_raws(o, strip) if strip else o
+            why = filler_issue(base, o_s)
+            if why:
+                return why
             known = {w.lower() for w in re.findall(r"[^\W\d_]+", PH_RE.sub(" ", base))}
             rest = " ".join(w for w in re.findall(r"[^\W\d_]+", PH_RE.sub(" ", o_s)) if w.lower() not in known)
             ar, lat = len(AR_RE.findall(rest)), len(LAT_RE.findall(rest))
@@ -1205,7 +1247,8 @@ def selftest(tr):
     for text, s, t in (("Hello", "en", "ar"), ("مرحبا", "ar", "en")):  # warm-up, not counted
         tr.field(text, s, t)
     for k in ("chars", "model_s", "kept", "split", "num_retry", "fmt_dropped", "script_retry", "len_reject",
-              "inline_ok", "protected_retry", "glossary_miss"):
+              "inline_ok", "protected_retry", "glossary_miss", "model_calls", "prompt_tokens", "prompt_s",
+              "gen_tokens", "gen_s"):
         STATS[k] = type(STATS[k])()
     for text, s, t in SAMPLES:
         out = tr.field(text, s, t)
@@ -1223,6 +1266,12 @@ def summary(wall):
         f"glossary_miss: {STATS['glossary_miss']}  skipped: {STATS['skipped']}")
     log(f"characters translated: {STATS['chars']}  seconds loading model: {STATS['load_s']:.1f}  "
         f"seconds in translate_batch: {STATS['model_s']:.1f}  chars/sec: {cps:.1f}  wall seconds: {wall:.1f}")
+    if STATS["model_calls"]:
+        pt = STATS["prompt_tokens"] / STATS["prompt_s"] if STATS["prompt_s"] else 0.0
+        gt = STATS["gen_tokens"] / STATS["gen_s"] if STATS["gen_s"] else 0.0
+        log(f"model calls: {STATS['model_calls']}  prompt: {STATS['prompt_tokens']} tokens in "
+            f"{STATS['prompt_s']:.1f} s ({pt:.1f} tokens/s)  generation: {STATS['gen_tokens']} tokens in "
+            f"{STATS['gen_s']:.1f} s ({gt:.1f} tokens/s)")
 
 
 def main():
