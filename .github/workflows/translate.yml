@@ -54,7 +54,11 @@ jobs:
           body=$(curl -fsS --retry 3 --max-time 30 \
             -H "X-YK-Token: $YK_WORKER_TOKEN" \
             "$YK_SITE_URL/wp-json/yk-translate/v1/pending?count_only=1")
-          n=$(printf '%s' "$body" | jq -r '.pending // 0')
+          # curl -f above still fails the run on 403/503 (wanted). Only a 200 with a non-JSON body is tolerated here.
+          if ! n=$(printf '%s' "$body" | jq -er '.pending // 0' 2>/dev/null); then
+            echo "::warning::the site answered with something that is not JSON (${#body} characters); nothing to do this run"
+            echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
           echo "pending jobs: $n"
           if [ "$n" = "0" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"

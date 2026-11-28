@@ -1094,6 +1094,10 @@ class Site:
                 try:
                     body = r.json()
                 except ValueError:
+                    # Not JSON (a maintenance page, a cache or firewall answer): say so, never read it as "no jobs".
+                    log(f"WARNING: {method} {path} answered HTTP {r.status_code} with a non-JSON body "
+                        f"({len(getattr(r, 'content', b'') or b'')} bytes, content-type "
+                        f"{(getattr(r, 'headers', None) or {}).get('Content-Type', '?')})")
                     body = {}
                 if not isinstance(body, dict):
                     body = {"_list": body}
